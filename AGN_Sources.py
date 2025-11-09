@@ -25,7 +25,6 @@ headers = np.array(headers)
 #start = 27
 #stop = len(headers)-1
 
-
 features = headers[[27, 30, 33, 36, 41, 43, 45, 48, 50, 52, 54]]
 features = np.append(features, ['TTYPE36', 'TTYPE37', 'TTYPE38', 'TTYPE39', 'TTYPE30']) #Adds nu_syn, nuFnu_synvar_index, frac_var, 4and redshift data
 #features = headers[np.linspace(start, stop, (stop-start)+1, dtype=int)]
@@ -34,30 +33,34 @@ features = np.append(features, ['TTYPE36', 'TTYPE37', 'TTYPE38', 'TTYPE39', 'TTY
     
 print(len(data_table))
 data_table = data_table[data_table['REDSHIFT'] != -np.inf]
+print(len(data_table))
+data_table = data_table[data_table['nu_syn'] != 0]
+print(len(data_table))
+
+#print(data_table[3])
+
+#for x in features[0:-1]:
+#    temp_header = hdu_table.header[x]
+#    data_table[temp_header] = np.log(data_table[temp_header])
+    
+#print(data_table[3])
+
 results = data_table['REDSHIFT']
-
-#print(data_table[data_table['CLASS'] == 'bcu']['REDSHIFT'])
-
 test = np.zeros((len(features), len(data_table['REDSHIFT'])))
 
 #print(test.shape)
 
 for i in range(len(features)):
     temp_header = hdu_table.header[features[i]]
-    #print(temp_header)
-    #print(data_table[temp_header])
     test[i, :] = data_table[temp_header]
 
-#print(features)
-#print(data_table[0][features])
-
 pls_work = np.corrcoef(test)
-#print(pls_work)
 
 features_names = ["" for i in range(len(features))]
 for i in range(len(features)):
     features_names[i] = hdu_table.header[features[i]]
     #print(min(data_table[features_names[i]]), max(data_table[features_names[i]]))
+
 
 sns.heatmap(pls_work, cmap='berlin')
 ax = plt.gca()
@@ -66,8 +69,16 @@ ax.set_xticklabels(features_names, rotation=90)
 ax.set_yticklabels(features_names, rotation=0)
 plt.show()
 
-print(np.std(data_table[data_table['CLASS'] == 'fsrq']['PL_Index']), np.std(data_table[data_table['CLASS'] == 'bll']['PL_Index']))
 
+print(np.std(data_table[data_table['CLASS'] == 'fsrq']['PL_Index']), np.std(data_table[data_table['CLASS'] == 'bll']['PL_Index']))
+'''
+fig = plt.figure()
+ax = fig.gca()
+ax.scatter(test[-1, :], np.log(test[-5,:]))
+ax.set_xlabel(features_names[-1])
+ax.set_ylabel(features_names[-5])
+plt.show()
+'''
 '''
 for num in range(len(features)):
     fig = plt.figure()
