@@ -36,6 +36,8 @@ data_table = data_table[data_table['REDSHIFT'] != -np.inf]
 print(len(data_table))
 data_table = data_table[data_table['nu_syn'] != 0]
 print(len(data_table))
+data_table = data_table[np.logical_not(np.isnan(data_table['unc_lp_beta']))]
+print(len(data_table))
 
 #print(data_table[3])
 
@@ -61,16 +63,19 @@ for i in range(len(features)):
     features_names[i] = hdu_table.header[features[i]]
     #print(min(data_table[features_names[i]]), max(data_table[features_names[i]]))
 
-
-sns.heatmap(pls_work, cmap='berlin')
+'''
+sns.heatmap(pls_work, cmap='berlin', annot=True)
 ax = plt.gca()
 ax.invert_xaxis()
 ax.set_xticklabels(features_names, rotation=90)
 ax.set_yticklabels(features_names, rotation=0)
 plt.show()
+'''
+
+plt.hist(data_table['unc_lp_index'])
 
 
-print(np.std(data_table[data_table['CLASS'] == 'fsrq']['PL_Index']), np.std(data_table[data_table['CLASS'] == 'bll']['PL_Index']))
+#print(np.std(data_table[data_table['CLASS'] == 'fsrq']['PL_Index']), np.std(data_table[data_table['CLASS'] == 'bll']['PL_Index']))
 '''
 fig = plt.figure()
 ax = fig.gca()
