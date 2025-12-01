@@ -34,8 +34,7 @@ pyro.clear_param_store()
 Corresponds to 1 classification label of the source (training label),
 and 17 unique inputs for the neural network (property value (+ uncertainty on some of them))
 '''
-features_master_array = [
-                        "TTYPE21",            #Class
+features_master_list = [
                         "TTYPE5",             #GLAT
                         "TTYPE6",             #GLON
                         "TTYPE7",             #Signif_Avg
@@ -52,7 +51,8 @@ features_master_array = [
                         "TTYPE37",            #nuFnu_syn, ***777 are missing data***
                         "TTYPE38",            #Variability_Index
                         "TTYPE39", "TTYPE40", #Frac_Variability + unc. ***874 are missing data (i.e: value 0 for frac_var, value 10.0 for unc.)***
-                        "TTYPE41"             #Highest_energy, ***1286 are missing data***
+                        "TTYPE41",             #Highest_energy, ***1286 are missing data***
+                        "TTYPE21"            #Classification - DO NOT USE TO TRAIN NETWORK!!!
                         ]
 
 def FeatureDisplay(hdu_table):
@@ -82,7 +82,7 @@ def MissingDataFiltering(hdu_table, filter_bad_sources=True):
     Also filters out sources with any associated flag *LIKELY ONLY TEMPORARY*
     
     Inputs: HDU table
-            Boolean depending on whether to filter bad sources or not (default True)
+            *Optional* Boolean depending on whether to filter bad sources or not (default True)
     Returns: HDU headers
              HDU data as separate arrays (NOT the full combined HDU table)
              
@@ -111,6 +111,145 @@ def MissingDataFiltering(hdu_table, filter_bad_sources=True):
         data_array = temp_filtered_table
 
     return header_array, data_array
+
+class FeatureDataset(Dataset):
+    '''
+    Packages the raw data and class tensors into a Dataset object
+    Compatible with DataLoaders, making them easier to batch and pass into the neural network
+    
+    __init__: Initialises the dataset (assigning the data, classes and any desired transform)
+    __len__: Returns the length of the feature tensor
+    __getitem__: Returns a single source's data and its correct classification      
+    '''
+    def __init__(self, feature_tensor, class_tensor, transform=None):
+        self.feature_tensor = feature_tensor
+        self.class_tensor = class_tensor
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.feature_tensor)
+
+    def __getitem__(self, idx):
+        source_features = self.feature_tensor[idx]
+        source_features = source_features.unsqueeze(0)
+
+        source_class = self.class_tensor[idx]
+        
+        return source_features, source_class
+    
+def InitialiseDataLoaders(feature_array, class_array, batch_size=64, shuffle=True):
+    '''
+    Package the input arrays into Pytorch Dataset and DataLoader objects
+    Inputs: 2D array for the network's input features
+            1D array for the actual source classifications
+            *Optional* Integer for batch size to use for DataLoader
+            *Optional* Boolean for whether the DataLoader should shuffle the input orders
+    Outputs: Tensor for the input features
+             Tensor for the actual classifications
+             DataLoader object containing the input features and classifications
+    '''
+    feature_tensor = torch.from_numpy(feature_array)
+    class_tensor = torch.from_numpy(class_array)
+    
+    dataset = FeatureDataset(feature_tensor, class_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    return feature_tensor, class_tensor, dataloader
+
+def ClassificationFiltering(input_master_array):
+    '''
+    Filters the master data array for sources that are not of the type BL Lac or FSRQ
+    Stores them all as lower-case string values
+    
+    Inputs: Master data array of all source data
+    Outputs: Master data array with the source info. properly formatted
+    '''
+    class_feature = "CLASS"
+    filtered_array = input_master_array
+    
+    #print(filtered_array["CLASS"][0:50])
+    
+    for i in range(len(filtered_array)):
+        class_temp = filtered_array[class_feature][i]
+        class_temp = class_temp.lower()
+        
+        if (class_temp != 'fsrq') and (class_temp != 'bll'):
+            class_temp = 'inval'
+            
+        filtered_array[class_feature][i] = class_temp
+        
+    filtered_array = filtered_array[filtered_array[class_feature] != 'inval']
+    #print(filtered_array["CLASS"][0:50])
+    
+    return filtered_array
+
+def PowerLawFormatting(input_master_array, exclude_super_exp_cutoff=False):
+    '''
+    Converts the different power-law entries into unique identifiers:
+        0 - PowerLaw
+        1 - LogParabola
+        2 - PLSuperExpCutoff4
+    Also includes the option to filter out PLSuperExpCutoff4 types
+    (Only 6 of them in the whole catalog, so could be unnecessary consideration for network...
+     However, all 6 are strong FSRQ/BL Lac detections!)
+    
+    Inputs: Master data array of all source data
+            *Optional* Boolean depending on whether to filter out PLSuperExpCutoff4
+    Outputs: Master data array with the PowerLaw column properly formatted
+    '''
+    PL_feature = "SpectrumType"
+    filtered_array = input_master_array
+    
+    for i in range(len(filtered_array)):
+        PL_temp = filtered_array[PL_feature][i]
+        
+        if PL_temp == 'PowerLaw':
+            PL_temp = 0
+        elif PL_temp == 'LogParabola':
+            PL_temp = 1
+        elif PL_temp == 'PLSuperExpCutoff4':
+            PL_temp = 2
+        else:
+            print("Something went wrong in PL formatting!")
+            
+        filtered_array[PL_feature][i] = int(PL_temp)
+
+    if exclude_super_exp_cutoff:
+        filtered_array = filtered_array[filtered_array[PL_feature] != 2]
+        
+    return filtered_array
+
+def SEDClassFormatting(input_master_array):
+    '''
+    Converts the different Spectral Energy Distribution (SED) class entries into unique identifiers:
+        0 - LSP
+        1 - ISP
+        2 - HSP
+    
+    Inputs: Master data array of all source data
+    Outputs: Master data array with the SED class column properly formatted
+    '''
+    SED_feature = "SED_class"
+    filtered_array = input_master_array
+    
+    for i in range(len(filtered_array)):
+        SED_temp = filtered_array[SED_feature][i]
+        
+        if SED_temp == 'LSP':
+            SED_temp = 0
+            
+        elif SED_temp == 'ISP':
+            SED_temp = 1
+            
+        elif SED_temp == 'HSP':
+            SED_temp = 2
+            
+        else:
+            print("Something went wrong in SED formatting!")
+            
+        filtered_array[SED_feature][i] = int(SED_temp)
+    
+    return filtered_array
 
 class ClassificationNeuralNetwork(PyroModule[nn.Module]):
     '''
@@ -184,7 +323,7 @@ def Model(input_features, correct_labels=None):
     with pyro.plate("results", logits.shape[0]):
         return pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)    
     
-def Guide(inputs_features, correct_labels, annealing_factor=1.0):
+def Guide(input_features, correct_labels, annealing_factor=1.0):
     '''
     Samples the weights of the neural network from the global parameters
     The poutine.scale() applies the KL-annealing factor, allowing some burn-in for the parameters
@@ -212,97 +351,58 @@ def Guide(inputs_features, correct_labels, annealing_factor=1.0):
     L2B_Std = torch.exp(L2B_LogStd)
     
     #New weights and biases are sampled with these local parameters
-    with pyro.poutine.scale(None, anneal_factor):
+    with pyro.poutine.scale(None, annealing_factor):
         pyro.sample('Layer1.weight', dist.Normal(L1W_Mean, L1W_Std).independent(2))
         pyro.sample('Layer1.bias', dist.Normal(L1B_Mean, L1B_Std).independent(1))
         pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
         pyro.sample('Layer2.bias', dist.Normal(L2B_Mean, L2B_Std).independent(1))
 
-class FeatureDataset(Dataset):
-    '''
-    Packages the raw data and class tensors into a Dataset object
-    Compatible with DataLoaders, making them easier to batch and pass into the neural network
-    
-    __init__: Initialises the dataset (assigning the data, classes and any desired transform)
-    __len__: Returns the length of the feature tensor
-    __getitem__: Returns a single source's data and its correct classification      
-    '''
-    def __init__(self, feature_tensor, class_tensor, transform=None):
-        self.feature_tensor = feature_tensor
-        self.class_tensor = class_tensor
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.feature_tensor)
-
-    def __getitem__(self, idx):
-        source_features = self.feature_tensor[idx]
-        source_features = source_features.unsqueeze(0)
-
-        source_class = self.class_tensor[idx]
-        
-        return source_data, source_class
-    
-def ClassificationFiltering(input_master_array):
-    '''
-    Filters the master data array for sources that are not of the type BL Lac or FSRQ
-    Then converts these class strings into numerical values that the 
-    
-    Inputs: Master data array of all source data
-    Outputs: Integer array of equivalent classifications
-    '''
-    class_feature = "CLASS"
-    filtered_array = input_master_array
-    
-    #print(filtered_array["CLASS"][0:50])
-    
-    for i in range(len(filtered_array)):
-        class_temp = filtered_array[class_feature][i]
-        class_temp = class_temp.lower()
-        
-        if (class_temp != 'fsrq') and (class_temp != 'bll') and (class_temp != 'bcu'):
-            class_temp = 'inval'
-            
-        filtered_array[class_feature][i] = class_temp
-        
-    filtered_array = filtered_array[filtered_array[class_feature] != 'inval']
-    #print(filtered_array["CLASS"][0:50])
-    
-    return filtered_array
-        
 
 ##### MAIN CODE #####
+
+#Import catalog and filter out missing data
 fits_file = fits.open("table-4LAC-DR3-h.fits")
 hdu_table = fits_file[1]
 master_headers_array, master_data_array = MissingDataFiltering(hdu_table)
 
-print(np.unique(master_data_array["CLASS"], return_counts=True))
-master_data_array = ClassificationFiltering(master_data_array)
-print(np.unique(master_data_array["CLASS"], return_counts=True))
+#Format the string-based columns into network-readable numerical values
+master_data_array = PowerLawFormatting(master_data_array)
+master_data_array = SEDClassFormatting(master_data_array)
 
-source_data_array = np.zeros((len(master_data_array), len(features_master_array)-1))
-source_classifications_array = np.array(len(master_data_array), dtype=str)
+## TRAINING DATA CREATION ##
+#Filter out non-relevant classifications for training set (FSRQs and BL Lacs)
+temp_data_array = ClassificationFiltering(master_data_array)
 
-'''
-for i in range(len(features_master_array)):
-    feature = features_master_array[i]
+#Split master data into network training data and classification "correct answers"
+train_data_array = np.zeros((len(temp_data_array), len(features_master_list)-1))
+train_class_array = np.array(len(temp_data_array), dtype=str)
+
+for i in range(len(features_master_list)):
+    feature = master_headers_array[features_master_list[i]]
     
-    if i==0:
-        source_classifications_array[:] = ClassificationFormatting(master_data_array)
+    if i==23: #Splits off the classification array
+        train_class_array = temp_data_array[feature]
+        
+        #Convert class strings to numerical values - easier to compare predictions to actual values!
+        train_class_array[train_class_array == 'fsrq'] = 1
+        train_class_array[train_class_array == 'bll'] = 0
+        train_class_array = np.asarray(train_class_array, dtype=int)
+        
     else:
-        source_data_array[i-1, :] =  master_data_array[master_headers_array[feature]]
-    
-    print(source_data_array.shape)
-    print(source_classifications_array.shape)
-'''
-    
-#ClassificationFiltering(master_data_array)
+        train_data_array[:, i] = temp_data_array[feature]
 
-#for i in range(len(master_network_headers[0])):
-#    print(master_network_headers[i])
-    #master_network_data = master_data_array
+        
+#Further split into training set, testing set, and validation set - 80% training set, 10% each validation and test sets
+split = int(round(0.8 * len(train_data_array)))
+test_data_array, test_class_array = train_data_array[split:], train_class_array[split:]
+train_data_array, train_class_array = train_data_array[0:split], train_class_array[0:split]
 
+split = int(round(0.5 * len(test_data_array)))
+val_data_array, val_class_array = test_data_array[split:], test_class_array[split:]
+test_data_array, test_class_array = test_data_array[0:split], test_class_array[0:split]
 
-
-#master_network_dataset = FeatureDataset()
+#Convert data arrays into Torch tensors and initialise DataLoaders 
+train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array)
+val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
+test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
