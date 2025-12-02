@@ -9,6 +9,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import seaborn as sns
 import astropy
 import torch
 import pyro
@@ -23,6 +24,8 @@ import pyro.distributions as dist
 #Functionally, makes sure that Pytorch and Pyro have been imported and linked correctly
 assert issubclass(PyroModule[nn.Linear], nn.Linear)
 assert issubclass(PyroModule[nn.Linear], PyroModule)
+
+start=time.time()
 
 #Set RNG seed for reproducibility and clear paramater store to make sure we start fresh!
 pyro.set_rng_seed(123)
@@ -272,45 +275,47 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
         
         #Declare parameters for each network weight as Pyro parameters, mean and std. of a normal distribution
         #########Log stds. declared since it helps with training#########
-        self.L1W_Mean = PyroParam(torch.zeros_like(self.Layer1.weight))
-        self.L1W_LogStd = PyroParam(torch.zeros_like(self.Layer1.weight))
-        self.L1W_Std = torch.exp(self.L1W_LogStd)
+        self.L1WMean = PyroParam(torch.zeros_like(self.Layer1.weight))
+        self.L1WLogStd = PyroParam(-torch.ones_like(self.Layer1.weight))
+        self.L1WStd = torch.exp(self.L1WLogStd)
 
-        self.L1B_Mean = PyroParam(torch.zeros_like(self.Layer1.bias))
-        self.L1B_LogStd = PyroParam(torch.zeros_like(self.Layer1.bias))
-        self.L1B_Std = torch.exp(self.L1B_LogStd)
+        self.L1BMean = PyroParam(torch.zeros_like(self.Layer1.bias))
+        self.L1BLogStd = PyroParam(-torch.ones_like(self.Layer1.bias))
+        self.L1BStd = torch.exp(self.L1BLogStd)
 
 
-        self.L2W_Mean = PyroParam(torch.zeros_like(self.Layer2.weight))
-        self.L2W_LogStd = PyroParam(torch.zeros_like(self.Layer2.weight))
-        self.L2W_Std = torch.exp(self.L2W_LogStd)
+        self.L2WMean = PyroParam(torch.zeros_like(self.Layer2.weight))
+        self.L2WLogStd = PyroParam(-torch.ones_like(self.Layer2.weight))
+        self.L2WStd = torch.exp(self.L2WLogStd)
 
-        self.L2B_Mean = PyroParam(torch.zeros_like(self.Layer2.bias))
-        self.L2B_LogStd = PyroParam(torch.zeros_like(self.Layer2.bias))
-        self.L2B_Std = torch.exp(self.L2B_LogStd)
+        self.L2BMean = PyroParam(torch.zeros_like(self.Layer2.bias))
+        self.L2BLogStd = PyroParam(-torch.ones_like(self.Layer2.bias))
+        self.L2BStd = torch.exp(self.L2BLogStd)
 
 
         #Declare layer weights and biases as Pyro samples from normal distribution based on previously-declared Pyro parameters
-        self.Layer1.weight = PyroSample(dist.Normal(self.L1W_Mean, self.L1W_Std).independent(2))
-        self.Layer1.bias = PyroSample(dist.Normal(self.L1B_Mean, self.L1B_Std).independent(1))
+        self.Layer1.weight = PyroSample(dist.Normal(self.L1WMean, self.L1WStd).independent(2))
+        self.Layer1.bias = PyroSample(dist.Normal(self.L1BMean, self.L1BStd).independent(1))
 
-        self.Layer2.weight = PyroSample(dist.Normal(self.L2W_Mean, self.L2W_Std).independent(2))
-        self.Layer2.bias = PyroSample(dist.Normal(self.L2B_Mean, self.L2B_Std).independent(1))
+        self.Layer2.weight = PyroSample(dist.Normal(self.L2WMean, self.L2WStd).independent(2))
+        self.Layer2.bias = PyroSample(dist.Normal(self.L2BMean, self.L2BStd).independent(1))
 
     def forward(self, input_data):
         #Simply runs through the network stack and returns the outputs
+        
+        #print(self.Layer2.bias)
         input_data = self.flatten(input_data)
         hidden_data = nn.functional.relu(self.Layer1(input_data))
         output_data = self.Layer2(hidden_data)
         return output_data
 
 #Initialise the neural network instance for the model and guide
-input_nodes = 17
-hidden_nodes = 64
+input_nodes = 23
+hidden_nodes = 10
 output_nodes = 2
 neural_network = ClassificationNeuralNetwork(input_nodes, hidden_nodes, output_nodes)
 
-def Model(input_features, correct_labels=None):
+def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0):
     '''
     Runs the model on the given input feature tensor, then sampling a classification from these logits
     
@@ -323,7 +328,7 @@ def Model(input_features, correct_labels=None):
     with pyro.plate("results", logits.shape[0]):
         return pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)    
     
-def Guide(input_features, correct_labels, annealing_factor=1.0):
+def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
     '''
     Samples the weights of the neural network from the global parameters
     The poutine.scale() applies the KL-annealing factor, allowing some burn-in for the parameters
@@ -333,25 +338,28 @@ def Guide(input_features, correct_labels, annealing_factor=1.0):
             Tensor of the correct classification labels, optional KL-annealing strength factor
     '''
     
+    #Scales the log_std size (e.g: a value of -2 means stds of e^-2 = 0.136...)
+    std_scale = -2
+    
     #Local copies of the global weight distribution parameters
-    L1W_Mean = pyro.param('L1W_Mean', torch.zeros_like(neural_network.Layer1.weight))
-    L1W_LogStd = pyro.param('L1W_LogStd', torch.zeros_like(neural_network.Layer1.weight))
+    L1W_Mean = pyro.param('L1WMean', torch.zeros_like(neural_network.Layer1.weight))
+    L1W_LogStd = pyro.param('L1WLogStd', std_scale*torch.ones_like(neural_network.Layer1.weight))
     L1W_Std = torch.exp(L1W_LogStd)
     
-    L1B_Mean = pyro.param('L1B_Mean', torch.zeros_like(neural_network.Layer1.bias))
-    L1B_LogStd = pyro.param('L1B_Mean', torch.zeros_like(neural_network.Layer1.bias))
+    L1B_Mean = pyro.param('L1BMean', torch.zeros_like(neural_network.Layer1.bias))
+    L1B_LogStd = pyro.param('L1BLogStd', std_scale*torch.ones_like(neural_network.Layer1.bias))
     L1B_Std = torch.exp(L1B_LogStd)
         
-    L2W_Mean = pyro.param('L2W_Mean', torch.zeros_like(neural_network.Layer2.weight))
-    L2W_LogStd = pyro.param('L2W_LogStd', torch.zeros_like(neural_network.Layer2.weight))
+    L2W_Mean = pyro.param('L2WMean', torch.zeros_like(neural_network.Layer2.weight))
+    L2W_LogStd = pyro.param('L2WLogStd', std_scale*torch.ones_like(neural_network.Layer2.weight))
     L2W_Std = torch.exp(L2W_LogStd)
     
-    L2B_Mean = pyro.param('L2B_Mean', torch.zeros_like(neural_network.Layer2.bias))
-    L2B_LogStd = pyro.param('L2B_Mean', torch.zeros_like(neural_network.Layer2.bias))
+    L2B_Mean = pyro.param('L2BMean', torch.zeros_like(neural_network.Layer2.bias))
+    L2B_LogStd = pyro.param('L2BLogStd', std_scale*torch.ones_like(neural_network.Layer2.bias))
     L2B_Std = torch.exp(L2B_LogStd)
     
     #New weights and biases are sampled with these local parameters
-    with pyro.poutine.scale(None, annealing_factor):
+    with pyro.poutine.scale(None, anneal_factor):
         pyro.sample('Layer1.weight', dist.Normal(L1W_Mean, L1W_Std).independent(2))
         pyro.sample('Layer1.bias', dist.Normal(L1B_Mean, L1B_Std).independent(1))
         pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
@@ -374,7 +382,7 @@ master_data_array = SEDClassFormatting(master_data_array)
 temp_data_array = ClassificationFiltering(master_data_array)
 
 #Split master data into network training data and classification "correct answers"
-train_data_array = np.zeros((len(temp_data_array), len(features_master_list)-1))
+train_data_array = np.zeros((len(temp_data_array), len(features_master_list)-1), dtype=np.float32)
 train_class_array = np.array(len(temp_data_array), dtype=str)
 
 for i in range(len(features_master_list)):
@@ -390,8 +398,12 @@ for i in range(len(features_master_list)):
         
     else:
         train_data_array[:, i] = temp_data_array[feature]
-
-        
+    
+#Log transformations of some of the columns since they have values over many orders of magnitude
+indices_to_log = [3, 4, 5, 6, 9, 12, 14, 17, 18, 19]
+for index in indices_to_log:
+    train_data_array[:, index] = np.log(train_data_array[:, index])
+       
 #Further split into training set, testing set, and validation set - 80% training set, 10% each validation and test sets
 split = int(round(0.8 * len(train_data_array)))
 test_data_array, test_class_array = train_data_array[split:], train_class_array[split:]
@@ -402,7 +414,115 @@ val_data_array, val_class_array = test_data_array[split:], test_class_array[spli
 test_data_array, test_class_array = test_data_array[0:split], test_class_array[0:split]
 
 #Convert data arrays into Torch tensors and initialise DataLoaders 
-train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array)
+train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array, batch_size=16)
 val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
+
+## NEURAL NETWORK TRAINING PROCESS ##
+def Sigmoid(epoch, total_epochs, ramp_factor=1/2):
+    '''
+    Applies a sigmoid function to the current epoch to find the KL annealing factor
+    Starts small, quickly ramps up midway through training, high value towards the end of training
+    Inputs: Int for the current epoch
+            Int for the total number of epochs
+            *Optional* Float to scale the effective midpoint; changing this changes how early the KL annealing "ramp-up" happens
+    Outputs: Float for the KL annealing factor to use for the current epoch
+    *Note that ramp_factor and the "-0.1" in the exponential are tuneable hyperparameters for the profile of the sigmoid function*
+    '''
+    sigmoid_midpoint = ramp_factor * total_epochs
+    return 1/(1 + np.exp(-0.1 * (epoch-sigmoid_midpoint)))
+
+def MCMCMethod():
+    num_samples=500
+    nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
+    mcmc = pyro.infer.MCMC(nuts_kernel, num_samples=num_samples)
+    mcmc.run(train_data_tensor, train_class_tensor)
+    
+    for i in range(20):
+        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
+        preds = predictive(val_data_tensor)
+        
+        correct_number=0
+        for x in range(num_samples):
+            correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
+        
+        #print(correct_number)
+        accuracy_rate = 100*(correct_number/num_samples)
+        print(np.mean(accuracy_rate))
+
+def SVIMethod():
+    #Run over a number of epochs (number of times to iterate through the dataset)
+    num_epochs = 5000
+    temp_decay = 0.01**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
+    print(temp_decay)
+    
+    #Define the network guide, network optimiser, and SVI training method
+    guide = CustomGuide
+    adam = pyro.optim.ClippedAdam({'lr': 5e-4, 'lrd': temp_decay})
+    svi = SVI(ModelFunc, guide=guide, optim=adam, loss=Trace_ELBO(retain_graph=True))
+    
+    last_10_accuracies = np.zeros(10)+50
+    losses_array = np.zeros(num_epochs)
+    for epoch in range(num_epochs):
+        epoch_loss = 0
+        
+        anneal_factor = 1#Sigmoid(epoch, num_epochs)
+        #print(f"Epoch {epoch+1}, KL Annealing Factor: {anneal_factor}")
+        
+        #Iterates through entire dataset, doing a SVI step after each batch to improve efficiency
+        neural_network.train()
+        for batch_index, (current_train_data, current_train_class) in enumerate(train_dataloader):
+            loss = svi.step(current_train_data, current_train_class, anneal_factor=anneal_factor)
+            epoch_loss += loss
+            
+            #if batch_index % 10 == 0:
+            #    print(f"Epoch: {epoch+1}; Batch: {batch_index}, Loss: {epoch_loss:.4f}")
+        
+        #Output average loss value over the whole epoch
+        average_loss = epoch_loss/len(train_dataloader)
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch+1} completed! Average loss: {average_loss:.4f}") 
+            print("Average log_std for 1st layer weights: ", np.mean(pyro.get_param_store()['L1WLogStd'].detach().cpu().numpy()))    
+            #print("Average log_std for 2nd layer weights: ", np.mean(pyro.get_param_store()['L2WLogStd'].detach().cpu().numpy()))
+        losses_array[epoch] = average_loss
+        
+        #Start the validation to test model accuracy after an epoch of training
+        neural_network.eval()
+        current_val_data, current_val_class = next(iter(test_dataloader))
+        correct_number = np.zeros(current_val_class.shape[0])
+        
+        #Number of times to sample the predictions for each data point - higher number = less spread, but more computation time!
+        sample_number = 200
+        for sample in range(sample_number):
+            #Sample the posterior weights and run the neural network on these
+            guide_trace = pyro.poutine.trace(guide).get_trace(None, None)
+            network_replay = pyro.poutine.replay(neural_network, trace=guide_trace)
+            
+            #Generates predictions from the network - no gradient tracking needed
+            with torch.no_grad():
+                logits = network_replay(current_val_data)
+                probs = nn.functional.softmax(logits, dim=-1)
+                predictions = torch.argmax(probs, dim=-1)
+                #if epoch == 9:
+                #    print(probs, predictions)
+    
+            correct_number += (predictions.cpu().numpy() == current_val_class.cpu().numpy())
+        
+        accuracy_rate = (correct_number/sample_number)*100
+        average_accuracy = np.mean(accuracy_rate)
+        last_10_accuracies[epoch%10] = average_accuracy
+        #print(f"Average accuracy after Epoch {epoch+1}: {average_accuracy:.2f}%")
+        if epoch % 10 == 0:
+            print(f"Rolling average accuracy (last 10 epochs): {np.mean(last_10_accuracies):.2f}%")
+
+    return losses_array
+losses_array = SVIMethod()
+#plt.scatter(np.linspace(0, num_epochs, num_epochs+1), losses_array, marker='x', color='black')
+finish = time.time()
+print("Run time:", finish-start, "seconds")
+
+import os
+import time
+time.sleep(10)
+os.system("shutdown.exe /h")
