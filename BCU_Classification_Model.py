@@ -28,18 +28,18 @@ assert issubclass(PyroModule[nn.Linear], PyroModule)
 start=time.time()
 
 #Set RNG seed for reproducibility and clear paramater store to make sure we start fresh!
-pyro.set_rng_seed(123)
+pyro.set_rng_seed(1234)
 pyro.clear_param_store()
 
 '''  
 ***CATALOG FEATURES MASTER LIST***
-18 unique features in master list (when grouped with uncertainties)
+18 unique features in master list (when grouped with uncertainties; 24 total entries)
 Corresponds to 1 classification label of the source (training label),
 and 17 unique inputs for the neural network (property value (+ uncertainty on some of them))
 '''
 features_master_list = [
-                        "TTYPE5",             #GLAT
-                        "TTYPE6",             #GLON
+                        "TTYPE5",             #GLON
+                        "TTYPE6",             #GLAT
                         "TTYPE7",             #Signif_Avg
                         "TTYPE8", "TTYPE9",   #Flux1000 + unc.
                         "TTYPE10", "TTYPE11", #Energy_Flux100 + unc.
@@ -54,15 +54,38 @@ features_master_list = [
                         "TTYPE37",            #nuFnu_syn, ***777 are missing data***
                         "TTYPE38",            #Variability_Index
                         "TTYPE39", "TTYPE40", #Frac_Variability + unc. ***874 are missing data (i.e: value 0 for frac_var, value 10.0 for unc.)***
-                        "TTYPE41",             #Highest_energy, ***1286 are missing data***
-                        "TTYPE21"            #Classification - DO NOT USE TO TRAIN NETWORK!!!
+                        "TTYPE41",            #Highest_energy, ***1286 are missing data***
+                        "TTYPE21"             #Classification - DO NOT USE TO TRAIN NETWORK!!!
                         ]
 
-def FeatureDisplay(hdu_table):
+normalisations = [
+                    "None",
+                    "None",
+                    "Log+Z",
+                    "Log+Z", "Propagate",
+                    "Log+Z", "Propagate",
+                    "None",
+                    "Z-score", "Propagate",
+                    "Log+Z",
+                    "Z-score", "Propagate",
+                    "Z-score", "Propagate", #LP_beta + unc., could go either z-score or log I'm not sure!
+                    "None",
+                    "None",
+                    "Log+Z",
+                    "Log+Z",
+                    "Log+Z",
+                    "Log+Z", "Propagate",
+                    "Log+Z",
+                    "None"
+                    ]
+#test = [i for i, x in enumerate(normalisations) if x != "None"]
+
+def FeatureDisplay(hdu_table, do_hist=False):
     '''
     Displays some basic info about each feature group in the input HDU table 
     
     Inputs: HDU table to be described
+            *Optional* Boolean for whether to produce histogram plots for the columns
     Outputs: Feature Name
              Number of elements
              Number of non-zero elements
@@ -78,6 +101,12 @@ def FeatureDisplay(hdu_table):
         print("#####Feature:#####", feature_header, "\nNum. elements:", len(feature_data), "\nNum. non-zero:", np.count_nonzero(feature_data))
         try: print(np.min(feature_data), np.max(feature_data))
         except: print("Not correct data type for min. and max. values")
+        if do_hist == True:
+            fig = plt.figure()
+            ax = fig.gca()
+            ax.hist(feature_data)
+            fig.suptitle(feature_header)
+            plt.show()
         
 def MissingDataFiltering(hdu_table, filter_bad_sources=True):
     '''
@@ -276,20 +305,20 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
         #Declare parameters for each network weight as Pyro parameters, mean and std. of a normal distribution
         #########Log stds. declared since it helps with training#########
         self.L1WMean = PyroParam(torch.zeros_like(self.Layer1.weight))
-        self.L1WLogStd = PyroParam(-torch.ones_like(self.Layer1.weight))
+        self.L1WLogStd = PyroParam(0*torch.ones_like(self.Layer1.weight))
         self.L1WStd = torch.exp(self.L1WLogStd)
 
         self.L1BMean = PyroParam(torch.zeros_like(self.Layer1.bias))
-        self.L1BLogStd = PyroParam(-torch.ones_like(self.Layer1.bias))
+        self.L1BLogStd = PyroParam(0*torch.ones_like(self.Layer1.bias))
         self.L1BStd = torch.exp(self.L1BLogStd)
 
 
         self.L2WMean = PyroParam(torch.zeros_like(self.Layer2.weight))
-        self.L2WLogStd = PyroParam(-torch.ones_like(self.Layer2.weight))
+        self.L2WLogStd = PyroParam(0*torch.ones_like(self.Layer2.weight))
         self.L2WStd = torch.exp(self.L2WLogStd)
 
         self.L2BMean = PyroParam(torch.zeros_like(self.Layer2.bias))
-        self.L2BLogStd = PyroParam(-torch.ones_like(self.Layer2.bias))
+        self.L2BLogStd = PyroParam(0*torch.ones_like(self.Layer2.bias))
         self.L2BStd = torch.exp(self.L2BLogStd)
 
 
@@ -311,7 +340,7 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
 
 #Initialise the neural network instance for the model and guide
 input_nodes = 23
-hidden_nodes = 10
+hidden_nodes = 64
 output_nodes = 2
 neural_network = ClassificationNeuralNetwork(input_nodes, hidden_nodes, output_nodes)
 
@@ -325,8 +354,9 @@ def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0):
              Tensor of the sampled values from the calculated logits if not
     '''
     logits = neural_network(input_features)
+    #with pyro.poutine.scale(None, anneal_factor):
     with pyro.plate("results", logits.shape[0]):
-        return pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)    
+        pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)    
     
 def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
     '''
@@ -338,8 +368,8 @@ def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
             Tensor of the correct classification labels, optional KL-annealing strength factor
     '''
     
-    #Scales the log_std size (e.g: a value of -2 means stds of e^-2 = 0.136...)
-    std_scale = -2
+    #Scales the log_std size (e.g: a value of 0 means stds of e^0 = 1)
+    std_scale = 0
     
     #Local copies of the global weight distribution parameters
     L1W_Mean = pyro.param('L1WMean', torch.zeros_like(neural_network.Layer1.weight))
@@ -365,6 +395,48 @@ def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
         pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
         pyro.sample('Layer2.bias', dist.Normal(L2B_Mean, L2B_Std).independent(1))
 
+def DataNormalisationAndScaling(input_data, normalisations):
+    '''
+    Normalises and scales our features based on the requested normalisation (defined at the program start)
+    Necessary so that the network can converge faster (and with more stability) to optimal parameter values
+    Scaling all features by Z-score also puts them all on equal importance to start with
+    Inputs: Array for the input data to be normalised
+            Array containing the normalisation methods to be used for each feature
+    Outputs: Array containing the normalised input data
+    '''
+    return_array = np.zeros(input_data.shape, dtype=np.float32)
+    
+    for i in range(input_data.shape[1]):
+        temp_array = input_data[:, i]
+        method = normalisations[i]
+        
+        if i==0: #Scales the GLON coordinate
+            temp_array = (temp_array-180)/180
+            
+        elif i==1: #Scales the GLAT coordinate
+            temp_array = temp_array/90
+        
+        elif method == "Propagate":
+            temp_last_array = input_data[:, i-1]
+            last_method = normalisations[i-1]
+            
+            if last_method == "Log+Z":
+                temp_array = np.abs(temp_array/(np.log(10)*temp_last_array))
+
+            temp_array = temp_array/np.std(temp_last_array)
+            
+        elif method == "Log+Z":
+            temp_array = np.log10(temp_array)
+            
+        if (method == "Log+Z") or (method == "Z-score"):
+            mean = np.mean(temp_array)
+            std = np.std(temp_array)
+            temp_array = (temp_array-mean)/std
+            
+        return_array[:, i] = temp_array
+        
+    return return_array
+            
 
 ##### MAIN CODE #####
 
@@ -398,12 +470,31 @@ for i in range(len(features_master_list)):
         
     else:
         train_data_array[:, i] = temp_data_array[feature]
-    
-#Log transformations of some of the columns since they have values over many orders of magnitude
-indices_to_log = [3, 4, 5, 6, 9, 12, 14, 17, 18, 19]
-for index in indices_to_log:
-    train_data_array[:, index] = np.log(train_data_array[:, index])
-       
+
+
+carryover = train_data_array
+train_data_array = DataNormalisationAndScaling(train_data_array, normalisations)
+
+'''
+for feat in range(train_data_array.shape[1]):
+    fig, (ax1, ax2) = plt.subplots(1, 2, sharey=True)
+    plt.subplots_adjust(wspace=0.05)
+    ax1.hist(carryover[:, feat])
+    ax2.hist(train_data_array[:, feat])
+    plt.suptitle(f"{hdu_table.header[features_master_list[feat]]} before and after normalisation/scaling")
+    plt.savefig(f"{hdu_table.header[features_master_list[feat]]} before and after normalisation+scaling.png")
+    plt.show()
+
+
+for x in range(train_data_array.shape[1]):
+    fig = plt.figure()
+    ax = fig.gca()
+    ax.hist(train_data_array[:, x])
+    fig.suptitle(f"Normalised {hdu_table.header[features_master_list[x]]}")
+    #plt.savefig(f"Filtered + normalised dataset, {hdu_table.header[features_master_list[x]]} histogram.png")
+    plt.show()
+'''
+
 #Further split into training set, testing set, and validation set - 80% training set, 10% each validation and test sets
 split = int(round(0.8 * len(train_data_array)))
 test_data_array, test_class_array = train_data_array[split:], train_class_array[split:]
@@ -420,7 +511,7 @@ test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(tes
 
 
 ## NEURAL NETWORK TRAINING PROCESS ##
-def Sigmoid(epoch, total_epochs, ramp_factor=1/2):
+def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
     '''
     Applies a sigmoid function to the current epoch to find the KL annealing factor
     Starts small, quickly ramps up midway through training, high value towards the end of training
@@ -431,10 +522,10 @@ def Sigmoid(epoch, total_epochs, ramp_factor=1/2):
     *Note that ramp_factor and the "-0.1" in the exponential are tuneable hyperparameters for the profile of the sigmoid function*
     '''
     sigmoid_midpoint = ramp_factor * total_epochs
-    return 1/(1 + np.exp(-0.1 * (epoch-sigmoid_midpoint)))
+    return 1/(1 + np.exp(-0.01 * (epoch-sigmoid_midpoint)))
 
 def MCMCMethod():
-    num_samples=500
+    num_samples=1000
     nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
     mcmc = pyro.infer.MCMC(nuts_kernel, num_samples=num_samples)
     mcmc.run(train_data_tensor, train_class_tensor)
@@ -444,21 +535,25 @@ def MCMCMethod():
         preds = predictive(val_data_tensor)
         
         correct_number=0
-        for x in range(num_samples):
+        for x in range(1000):
             correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
         
         #print(correct_number)
-        accuracy_rate = 100*(correct_number/num_samples)
+        accuracy_rate = 100*(correct_number/1000)
         print(np.mean(accuracy_rate))
+        
+    return mcmc
+
 
 def SVIMethod():
     #Run over a number of epochs (number of times to iterate through the dataset)
-    num_epochs = 5000
+    num_epochs = 1000
     temp_decay = 0.01**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
-    print(temp_decay)
+    #print(KL_annealing, temp_decay)
     
     #Define the network guide, network optimiser, and SVI training method
-    guide = CustomGuide
+    #guide = CustomGuide
+    guide = pyro.infer.autoguide.AutoNormal(ModelFunc)
     adam = pyro.optim.ClippedAdam({'lr': 5e-4, 'lrd': temp_decay})
     svi = SVI(ModelFunc, guide=guide, optim=adam, loss=Trace_ELBO(retain_graph=True))
     
@@ -467,7 +562,7 @@ def SVIMethod():
     for epoch in range(num_epochs):
         epoch_loss = 0
         
-        anneal_factor = 1#Sigmoid(epoch, num_epochs)
+        anneal_factor = 1# Sigmoid(epoch, num_epochs)
         #print(f"Epoch {epoch+1}, KL Annealing Factor: {anneal_factor}")
         
         #Iterates through entire dataset, doing a SVI step after each batch to improve efficiency
@@ -483,7 +578,7 @@ def SVIMethod():
         average_loss = epoch_loss/len(train_dataloader)
         if epoch % 10 == 0:
             print(f"Epoch {epoch+1} completed! Average loss: {average_loss:.4f}") 
-            print("Average log_std for 1st layer weights: ", np.mean(pyro.get_param_store()['L1WLogStd'].detach().cpu().numpy()))    
+            #print("Average log_std for 1st layer weights: ", np.mean(pyro.get_param_store()['L1WLogStd'].detach().cpu().numpy()))    
             #print("Average log_std for 2nd layer weights: ", np.mean(pyro.get_param_store()['L2WLogStd'].detach().cpu().numpy()))
         losses_array[epoch] = average_loss
         
@@ -517,12 +612,15 @@ def SVIMethod():
             print(f"Rolling average accuracy (last 10 epochs): {np.mean(last_10_accuracies):.2f}%")
 
     return losses_array
+
 losses_array = SVIMethod()
-#plt.scatter(np.linspace(0, num_epochs, num_epochs+1), losses_array, marker='x', color='black')
+#mcmc = MCMCMethod()
+
+plt.scatter(np.linspace(1, 1000, 1000), np.log(losses_array), marker='x', color='black')
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 
-import os
-import time
-time.sleep(10)
-os.system("shutdown.exe /h")
+#import os
+#import time
+#time.sleep(10)
+#os.system("shutdown.exe /h")
