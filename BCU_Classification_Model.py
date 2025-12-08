@@ -421,9 +421,13 @@ def DataNormalisationAndScaling(input_data, normalisations):
             last_method = normalisations[i-1]
             
             if last_method == "Log+Z":
-                temp_array = np.abs(temp_array/(np.log(10)*temp_last_array))
+                #print("before:", temp_last_array[17], "pm", temp_array[17])
+                temp_array = np.abs(temp_array/(np.log(10)*(10**temp_last_array)))
+                temp_array = temp_array/np.std(temp_last_array)
+                #print("after:", temp_last_array[17], "pm", temp_array[17])
 
-            temp_array = temp_array/np.std(temp_last_array)
+            else:
+                temp_array = temp_array/np.std(temp_last_array)
             
         elif method == "Log+Z":
             temp_array = np.log10(temp_array)
@@ -470,7 +474,6 @@ for i in range(len(features_master_list)):
         
     else:
         train_data_array[:, i] = temp_data_array[feature]
-
 
 carryover = train_data_array
 train_data_array = DataNormalisationAndScaling(train_data_array, normalisations)
@@ -547,8 +550,8 @@ def MCMCMethod():
 
 def SVIMethod():
     #Run over a number of epochs (number of times to iterate through the dataset)
-    num_epochs = 1000
-    temp_decay = 0.01**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
+    num_epochs = 300
+    temp_decay = 0.001**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
     #print(KL_annealing, temp_decay)
     
     #Define the network guide, network optimiser, and SVI training method
@@ -616,7 +619,7 @@ def SVIMethod():
 losses_array = SVIMethod()
 #mcmc = MCMCMethod()
 
-plt.scatter(np.linspace(1, 1000, 1000), np.log(losses_array), marker='x', color='black')
+#plt.scatter(np.linspace(1, 1000, 1000), np.log(losses_array), marker='x', color='black')
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 
