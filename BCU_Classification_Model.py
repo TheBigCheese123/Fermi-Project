@@ -6,6 +6,7 @@ Created on Fri Nov 28 13:08:30 2025
 """
 
 import time
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -301,24 +302,26 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
         self.Layer1 = PyroModule[nn.Linear](input_dim, hidden_dim)
         self.Layer2 = PyroModule[nn.Linear](hidden_dim, output_dim)
         
-        
         #Declare parameters for each network weight as Pyro parameters, mean and std. of a normal distribution
         #########Log stds. declared since it helps with training#########
+        
+        std_scale = -1
+        
         self.L1WMean = PyroParam(torch.zeros_like(self.Layer1.weight))
-        self.L1WLogStd = PyroParam(0*torch.ones_like(self.Layer1.weight))
+        self.L1WLogStd = PyroParam(std_scale*torch.ones_like(self.Layer1.weight))
         self.L1WStd = torch.exp(self.L1WLogStd)
 
         self.L1BMean = PyroParam(torch.zeros_like(self.Layer1.bias))
-        self.L1BLogStd = PyroParam(0*torch.ones_like(self.Layer1.bias))
+        self.L1BLogStd = PyroParam(std_scale*torch.ones_like(self.Layer1.bias))
         self.L1BStd = torch.exp(self.L1BLogStd)
 
 
         self.L2WMean = PyroParam(torch.zeros_like(self.Layer2.weight))
-        self.L2WLogStd = PyroParam(0*torch.ones_like(self.Layer2.weight))
+        self.L2WLogStd = PyroParam(std_scale*torch.ones_like(self.Layer2.weight))
         self.L2WStd = torch.exp(self.L2WLogStd)
 
         self.L2BMean = PyroParam(torch.zeros_like(self.Layer2.bias))
-        self.L2BLogStd = PyroParam(0*torch.ones_like(self.Layer2.bias))
+        self.L2BLogStd = PyroParam(std_scale*torch.ones_like(self.Layer2.bias))
         self.L2BStd = torch.exp(self.L2BLogStd)
 
 
@@ -527,27 +530,6 @@ def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
     sigmoid_midpoint = ramp_factor * total_epochs
     return 1/(1 + np.exp(-0.01 * (epoch-sigmoid_midpoint)))
 
-def MCMCMethod():
-    num_samples=1000
-    nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
-    mcmc = pyro.infer.MCMC(nuts_kernel, num_samples=num_samples)
-    mcmc.run(train_data_tensor, train_class_tensor)
-    
-    for i in range(20):
-        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
-        preds = predictive(val_data_tensor)
-        
-        correct_number=0
-        for x in range(1000):
-            correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
-        
-        #print(correct_number)
-        accuracy_rate = 100*(correct_number/1000)
-        print(np.mean(accuracy_rate))
-        
-    return mcmc
-
-
 def SVIMethod():
     #Run over a number of epochs (number of times to iterate through the dataset)
     num_epochs = 300
@@ -616,14 +598,72 @@ def SVIMethod():
 
     return losses_array
 
-losses_array = SVIMethod()
-#mcmc = MCMCMethod()
+def MCMCMethod():
+    num_samples=4000
+    nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
+    mcmc = pyro.infer.MCMC(nuts_kernel, num_samples=num_samples)
+    mcmc.run(train_data_tensor, train_class_tensor)
+    
+    for i in range(20):
+        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
+        preds = predictive(val_data_tensor)
+        
+        correct_number=0
+        for x in range(1000):
+            correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
+        
+        #print(correct_number)
+        accuracy_rate = 100*(correct_number/1000)
+        print(np.mean(accuracy_rate))
+        
+    return mcmc
+
+#losses_array = SVIMethod()
+mcmc = MCMCMethod()
 
 #plt.scatter(np.linspace(1, 1000, 1000), np.log(losses_array), marker='x', color='black')
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 
-#import os
-#import time
-#time.sleep(10)
-#os.system("shutdown.exe /h")
+for i in range(5):
+    predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
+    preds = predictive(test_data_tensor)
+    
+    correct_number=0
+    for x in range(1000):
+        correct_number += (preds['obs'][x].cpu().numpy() == test_class_tensor.cpu().numpy())
+    
+    #print(correct_number)
+    accuracy_rate = 100*(correct_number/1000)
+    print(np.mean(accuracy_rate))
+    
+mean_pred = np.mean(preds['obs'].cpu().numpy(), axis=0)
+plt.hist(mean_pred)
+plt.title("Mean prediction per object")
+plt.show()
+
+entropy = -(mean_pred*np.log(mean_pred+1e-9) 
+            + (1-mean_pred)*np.log(1-mean_pred+1e-9))
+
+plt.hist(entropy, bins=50)
+plt.title("Entropy of each object prediction")
+plt.show()
+
+#import arviz as az
+#idata = az.from_pyro(mcmc)
+#az.plot_trace(idata, var_names=["some_weight"])
+
+plt.plot(mcmc.get_samples()['Layer1.weight'][:, 44, 13], marker='x', alpha=0.5)
+plt.show()
+plt.plot(mcmc.get_samples()['Layer1.weight'][:, 11, 18], marker='x', alpha=0.5)
+plt.show()
+plt.plot(mcmc.get_samples()['Layer2.weight'][:, 1, 13], alpha=0.5)
+plt.show()
+plt.plot(mcmc.get_samples()['Layer2.weight'][:, 0, 4], alpha=0.5)
+plt.show()
+plt.plot(mcmc.get_samples()['Layer2.bias'][:, 1], alpha=0.5)
+plt.show()
+#plt.title("Sampled values of different weights/biases")
+
+time.sleep(10)
+os.system("shutdown.exe /h")
