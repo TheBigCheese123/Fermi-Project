@@ -14,6 +14,7 @@ import seaborn as sns
 import astropy
 import torch
 import pyro
+import arviz as az
 from astropy.io import fits
 from torch import nn
 import torchvision.transforms as transforms
@@ -305,7 +306,7 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
         #Declare parameters for each network weight as Pyro parameters, mean and std. of a normal distribution
         #########Log stds. declared since it helps with training#########
         
-        std_scale = -1
+        std_scale = 0
         
         self.L1WMean = PyroParam(torch.zeros_like(self.Layer1.weight))
         self.L1WLogStd = PyroParam(std_scale*torch.ones_like(self.Layer1.weight))
@@ -478,6 +479,14 @@ for i in range(len(features_master_list)):
     else:
         train_data_array[:, i] = temp_data_array[feature]
 
+#Makes sure that the data and classes have been split into correctly-sized arrays, then shuffles them (whilst maintaining correspondence)
+assert len(train_data_array) == len(train_class_array)
+#print(train_data_array[[899, 639, 751, 812, 652], 0], train_class_array[[899, 639, 751, 812, 652]])
+shuffled_indices = np.random.permutation(len(train_data_array))
+train_data_array = train_data_array[shuffled_indices]
+train_class_array = train_class_array[shuffled_indices]
+#print(shuffled_indices[2:7], train_data_array[2:7, 0], train_class_array[2:7])
+
 carryover = train_data_array
 train_data_array = DataNormalisationAndScaling(train_data_array, normalisations)
 
@@ -515,7 +524,6 @@ train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(
 val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
-
 ## NEURAL NETWORK TRAINING PROCESS ##
 def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
     '''
@@ -532,14 +540,14 @@ def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
 
 def SVIMethod():
     #Run over a number of epochs (number of times to iterate through the dataset)
-    num_epochs = 300
+    num_epochs = 1000
     temp_decay = 0.001**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
     #print(KL_annealing, temp_decay)
     
     #Define the network guide, network optimiser, and SVI training method
-    #guide = CustomGuide
-    guide = pyro.infer.autoguide.AutoNormal(ModelFunc)
-    adam = pyro.optim.ClippedAdam({'lr': 5e-4, 'lrd': temp_decay})
+    guide = CustomGuide
+    #guide = pyro.infer.autoguide.AutoNormal(ModelFunc)
+    adam = pyro.optim.ClippedAdam({'lr': 1e-3, 'lrd': temp_decay})
     svi = SVI(ModelFunc, guide=guide, optim=adam, loss=Trace_ELBO(retain_graph=True))
     
     last_10_accuracies = np.zeros(10)+50
@@ -599,9 +607,9 @@ def SVIMethod():
     return losses_array
 
 def MCMCMethod():
-    num_samples=4000
+    num_samples=1000
     nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
-    mcmc = pyro.infer.MCMC(nuts_kernel, num_samples=num_samples)
+    mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples)
     mcmc.run(train_data_tensor, train_class_tensor)
     
     for i in range(20):
@@ -609,11 +617,11 @@ def MCMCMethod():
         preds = predictive(val_data_tensor)
         
         correct_number=0
-        for x in range(1000):
+        for x in range(num_samples):
             correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
         
         #print(correct_number)
-        accuracy_rate = 100*(correct_number/1000)
+        accuracy_rate = 100*(correct_number/num_samples)
         print(np.mean(accuracy_rate))
         
     return mcmc
@@ -625,21 +633,29 @@ mcmc = MCMCMethod()
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 
+
 for i in range(5):
     predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
     preds = predictive(test_data_tensor)
-    
     correct_number=0
-    for x in range(1000):
+    for x in range(preds['obs'].shape[0]):
         correct_number += (preds['obs'][x].cpu().numpy() == test_class_tensor.cpu().numpy())
     
     #print(correct_number)
-    accuracy_rate = 100*(correct_number/1000)
+    accuracy_rate = 100*(correct_number/preds['obs'].shape[0])
     print(np.mean(accuracy_rate))
+
     
+fsrqs = np.where(test_class_tensor.cpu().numpy() == 1)
+blls = np.where(test_class_tensor.cpu().numpy() == 0)
 mean_pred = np.mean(preds['obs'].cpu().numpy(), axis=0)
-plt.hist(mean_pred)
-plt.title("Mean prediction per object")
+
+plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
+plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
+plt.xlabel("Mean prediction")
+plt.ylabel("Box density")
+plt.title("Mean prediction per object type (BL Lac = 0, FSRQ = 1)")
+plt.legend()
 plt.show()
 
 entropy = -(mean_pred*np.log(mean_pred+1e-9) 
@@ -649,9 +665,11 @@ plt.hist(entropy, bins=50)
 plt.title("Entropy of each object prediction")
 plt.show()
 
-#import arviz as az
-#idata = az.from_pyro(mcmc)
-#az.plot_trace(idata, var_names=["some_weight"])
+trace_params = mcmc.get_samples()['Layer2.weight'].cpu().numpy()
+trace_params = np.array([trace_params])
+az.plot_trace(trace_params)
+plt.title("Posterior distributions for Layer 2 weights")
+plt.show()
 
 plt.plot(mcmc.get_samples()['Layer1.weight'][:, 44, 13], marker='x', alpha=0.5)
 plt.show()
@@ -665,5 +683,5 @@ plt.plot(mcmc.get_samples()['Layer2.bias'][:, 1], alpha=0.5)
 plt.show()
 #plt.title("Sampled values of different weights/biases")
 
-time.sleep(10)
-os.system("shutdown.exe /h")
+#time.sleep(10)
+#os.system("shutdown.exe /h")
