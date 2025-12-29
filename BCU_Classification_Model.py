@@ -60,7 +60,7 @@ features_master_list = [
                         "TTYPE21"             #Classification - DO NOT USE TO TRAIN NETWORK!!!
                         ]
 
-normalisations = [
+transformations = [
                     "None",
                     "None",
                     "Log+Z",
@@ -306,7 +306,7 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
         #Declare parameters for each network weight as Pyro parameters, mean and std. of a normal distribution
         #########Log stds. declared since it helps with training#########
         
-        std_scale = 0
+        std_scale = -1
         
         self.L1WMean = PyroParam(torch.zeros_like(self.Layer1.weight))
         self.L1WLogStd = PyroParam(std_scale*torch.ones_like(self.Layer1.weight))
@@ -373,7 +373,7 @@ def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
     '''
     
     #Scales the log_std size (e.g: a value of 0 means stds of e^0 = 1)
-    std_scale = 0
+    std_scale = -1
     
     #Local copies of the global weight distribution parameters
     L1W_Mean = pyro.param('L1WMean', torch.zeros_like(neural_network.Layer1.weight))
@@ -399,51 +399,102 @@ def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
         pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
         pyro.sample('Layer2.bias', dist.Normal(L2B_Mean, L2B_Std).independent(1))
 
-def DataNormalisationAndScaling(input_data, normalisations):
+def DataTransformation(input_data, transformations):
     '''
-    Normalises and scales our features based on the requested normalisation (defined at the program start)
-    Necessary so that the network can converge faster (and with more stability) to optimal parameter values
-    Scaling all features by Z-score also puts them all on equal importance to start with
-    Inputs: Array for the input data to be normalised
-            Array containing the normalisation methods to be used for each feature
-    Outputs: Array containing the normalised input data
+    Normalises and scales our features based on the requested transformation list (defined at the program start)
+    Master function checks each transformation method, and passes those features to the correct transformation function 
+    
+    Inputs: Array containing the input data to be transformed
+            Array containing the transformation methods to be used for each feature
+    Outputs: Array containing the transformed input data
     '''
     return_array = np.zeros(input_data.shape, dtype=np.float32)
     
     for i in range(input_data.shape[1]):
         temp_array = input_data[:, i]
-        method = normalisations[i]
+        method = transformations[i]
         
-        if i==0: #Scales the GLON coordinate
-            temp_array = (temp_array-180)/180
+        #for loop will load uncertainties as current feature - want to skip these since we already deal with them!
+        if method != "Propagate":
             
-        elif i==1: #Scales the GLAT coordinate
-            temp_array = temp_array/90
-        
-        elif method == "Propagate":
-            temp_last_array = input_data[:, i-1]
-            last_method = normalisations[i-1]
-            
-            if last_method == "Log+Z":
-                #print("before:", temp_last_array[17], "pm", temp_array[17])
-                temp_array = np.abs(temp_array/(np.log(10)*(10**temp_last_array)))
-                temp_array = temp_array/np.std(temp_last_array)
-                #print("after:", temp_last_array[17], "pm", temp_array[17])
+            #Prevents overflowing at end of array
+            if i < input_data.shape[1]:
+                temp_prop_array = None
+                next_method = transformations[i+1]
+                    
+                #Assigns temp_prop_array ONLY if current feature has an associated uncertainty
+                if next_method == "Propagate":
+                    temp_prop_array = input_data[:, i+1]
+                
+            #Performs log transform on data and uncertainties
+            if method == "Log":
+                temp_array, temp_prop_array = DataLogTransform(temp_array, temp_prop_array)
+                
+            #Performs z-score transform on data and uncertainties
+            elif method == "Z-score":
+                temp_array, temp_prop_array = DataZScoring(temp_array, temp_prop_array)
+    
+            #Performs both log and z-score transforms on data and uncertainties
+            elif method == "Log+Z":
+                temp_array, temp_prop_array = DataLogTransform(temp_array, temp_prop_array)
+                temp_array, temp_prop_array = DataZScoring(temp_array, temp_prop_array)
+    
+            elif i==0: #Scales the GLON coordinate
+                temp_array = (temp_array-180)/180
+                
+            elif i==1: #Scales the GLAT coordinate
+                temp_array = temp_array/90 
+                
+            elif method != "None":
+                print("Assigned a method that is not accounted for in the transformation function!!!")
+                
+            #Inserts transformed data into new array
+            return_array[:, i] = temp_array
+    
+            #Only inserts propagated uncertainties if feature actually had them to begin with!
+            if temp_prop_array is not None:
+                return_array[:, i+1] = temp_prop_array
 
-            else:
-                temp_array = temp_array/np.std(temp_last_array)
-            
-        elif method == "Log+Z":
-            temp_array = np.log10(temp_array)
-            
-        if (method == "Log+Z") or (method == "Z-score"):
-            mean = np.mean(temp_array)
-            std = np.std(temp_array)
-            temp_array = (temp_array-mean)/std
-            
-        return_array[:, i] = temp_array
-        
     return return_array
+
+def DataLogTransform(input_data, propagation_array):
+    '''
+    Applies a Log10 transform to the input data
+    Propagates this through the uncertainties if they are provided
+    Inputs: Array containing the input data to be logged
+            Array containing the corresponding uncertainties to be propagated (or None if no uncertainties)
+    Returns: Array containing the logged data
+             Array containing the Log10 propagated uncertainties (or None if no uncertainties)
+    '''    
+    temp_array = input_data
+    temp_prop_array=None
+    
+    if propagation_array is not None:
+        temp_prop_array = propagation_array
+        temp_prop_array = np.abs(temp_prop_array/(np.log(10) * temp_array))
+    
+    return np.log10(temp_array), temp_prop_array
+            
+def DataZScoring(input_data, propagation_array):
+    '''
+    Applies the Z-score scaling to the input data
+    Propagates this through the uncertainties if they are provided
+    Inputs: Array containing the input data to be z-scored
+            Array containing the corresponding uncertainties to be propagated (or None if no uncertainties)
+    Returns: Array containing the z-scored data
+             Array containing the z-score propagated uncertainties (or None if no uncertainties)
+    '''
+    temp_array = input_data
+    temp_prop_array=None
+
+    mean = np.mean(temp_array)
+    std = np.std(temp_array)
+    
+    if propagation_array is not None:
+        temp_prop_array = propagation_array
+        temp_prop_array = temp_prop_array/std
+
+    return (temp_array-mean)/std, temp_prop_array
             
 
 ##### MAIN CODE #####
@@ -488,7 +539,7 @@ train_class_array = train_class_array[shuffled_indices]
 #print(shuffled_indices[2:7], train_data_array[2:7, 0], train_class_array[2:7])
 
 carryover = train_data_array
-train_data_array = DataNormalisationAndScaling(train_data_array, normalisations)
+train_data_array = DataTransformation(carryover, transformations)
 
 '''
 for feat in range(train_data_array.shape[1]):
@@ -633,7 +684,7 @@ mcmc = MCMCMethod()
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 
-
+'''
 for i in range(5):
     predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
     preds = predictive(test_data_tensor)
@@ -644,44 +695,57 @@ for i in range(5):
     #print(correct_number)
     accuracy_rate = 100*(correct_number/preds['obs'].shape[0])
     print(np.mean(accuracy_rate))
+'''
 
+def MCMCPlotting(mcmc):
+    predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
+    preds = predictive(test_data_tensor)
+    correct_number=0
+    for x in range(preds['obs'].shape[0]):
+        correct_number += (preds['obs'][x].cpu().numpy() == test_class_tensor.cpu().numpy())
     
-fsrqs = np.where(test_class_tensor.cpu().numpy() == 1)
-blls = np.where(test_class_tensor.cpu().numpy() == 0)
-mean_pred = np.mean(preds['obs'].cpu().numpy(), axis=0)
-
-plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
-plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
-plt.xlabel("Mean prediction")
-plt.ylabel("Box density")
-plt.title("Mean prediction per object type (BL Lac = 0, FSRQ = 1)")
-plt.legend()
-plt.show()
-
-entropy = -(mean_pred*np.log(mean_pred+1e-9) 
-            + (1-mean_pred)*np.log(1-mean_pred+1e-9))
-
-plt.hist(entropy, bins=50)
-plt.title("Entropy of each object prediction")
-plt.show()
-
-trace_params = mcmc.get_samples()['Layer2.weight'].cpu().numpy()
-trace_params = np.array([trace_params])
-az.plot_trace(trace_params)
-plt.title("Posterior distributions for Layer 2 weights")
-plt.show()
-
-plt.plot(mcmc.get_samples()['Layer1.weight'][:, 44, 13], marker='x', alpha=0.5)
-plt.show()
-plt.plot(mcmc.get_samples()['Layer1.weight'][:, 11, 18], marker='x', alpha=0.5)
-plt.show()
-plt.plot(mcmc.get_samples()['Layer2.weight'][:, 1, 13], alpha=0.5)
-plt.show()
-plt.plot(mcmc.get_samples()['Layer2.weight'][:, 0, 4], alpha=0.5)
-plt.show()
-plt.plot(mcmc.get_samples()['Layer2.bias'][:, 1], alpha=0.5)
-plt.show()
-#plt.title("Sampled values of different weights/biases")
-
+    #print(correct_number)
+    accuracy_rate = 100*(correct_number/preds['obs'].shape[0])
+    print(np.mean(accuracy_rate))
+        
+    fsrqs = np.where(test_class_tensor.cpu().numpy() == 1)
+    blls = np.where(test_class_tensor.cpu().numpy() == 0)
+    mean_pred = np.mean(preds['obs'].cpu().numpy(), axis=0)
+    
+    plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
+    plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
+    plt.plot([np.percentile(mean_pred[fsrqs], 20), np.percentile(mean_pred[fsrqs], 20)], [0,50], label="FSRQ 80th Percentile", ls = '--', color="Black")
+    plt.plot([np.percentile(mean_pred[blls], 80), np.percentile(mean_pred[blls], 80)], [0,50], label="BL Lac 80th Percentile", ls = '--', color="Magenta")
+    plt.xlabel("Mean prediction")
+    plt.ylabel("Box density")
+    plt.title("Mean prediction per object type (BL Lac = 0, FSRQ = 1)")
+    plt.legend()
+    plt.show()
+    
+    entropy = -((mean_pred*np.log(mean_pred+1e-9)) + ((1-mean_pred)*np.log(1-mean_pred+1e-9)))
+    
+    plt.hist(entropy, bins=50)
+    plt.title("Entropy of each object prediction")
+    plt.show()
+    
+    trace_params = mcmc.get_samples()['Layer2.weight'].cpu().numpy()
+    trace_params = np.array([trace_params])
+    az.plot_trace(trace_params)
+    plt.title("Posterior distributions for Layer 2 weights")
+    plt.show()
+    
+    #plt.plot(mcmc.get_samples()['Layer1.weight'][:, 44, 13], marker='x', alpha=0.5)
+    #plt.show()
+    #plt.plot(mcmc.get_samples()['Layer1.weight'][:, 11, 18], marker='x', alpha=0.5)
+    #plt.show()
+    #plt.plot(mcmc.get_samples()['Layer2.weight'][:, 1, 13], alpha=0.5)
+    #plt.show()
+    #plt.plot(mcmc.get_samples()['Layer2.weight'][:, 0, 4], alpha=0.5)
+    #plt.show()
+    #plt.plot(mcmc.get_samples()['Layer2.bias'][:, 1], alpha=0.5)
+    #plt.show()
+    #plt.title("Sampled values of different weights/biases")
+    
+MCMCPlotting(mcmc)
 #time.sleep(10)
 #os.system("shutdown.exe /h")
