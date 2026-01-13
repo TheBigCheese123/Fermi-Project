@@ -60,6 +60,8 @@ features_master_list = [
                         "TTYPE21"             #Classification - DO NOT USE TO TRAIN NETWORK!!!
                         ]
 
+#CONSIDER ADDING TTYPE32/33 AND TTYPE34/35 - HE_EPeak+unc. and HE_nuFnuPeak+unc. columns
+
 transformations = [
                     "None",
                     "None",
@@ -141,7 +143,11 @@ def MissingDataFiltering(hdu_table, filter_bad_sources=True):
         flag_feature = header_array["TTYPE20"]
         temp_filtered_table = temp_filtered_table[(temp_filtered_table[flag_feature] == np.int16(0))]
         #print("Flags filtered, new length: ", len(temp_filtered_table))
-        
+        '''
+        for x in ["TTYPE32", "TTYPE33", "TTYPE34", "TTYPE35"]:
+            print("Feature ", header_array[x], "Num. non-zero left:", len(temp_filtered_table[(temp_filtered_table[header_array[x]] != -np.inf) & (not np.isnan(temp_filtered_table[header_array[x]]))]))            
+            print(temp_filtered_table[header_array[x]][10:20], temp_filtered_table[header_array[x]][10:20])
+        '''    
         data_array = temp_filtered_table
 
     return header_array, data_array
@@ -336,37 +342,79 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
     def forward(self, input_data):
         #Simply runs through the network stack and returns the outputs
         
-        #print(self.Layer2.bias)
         input_data = self.flatten(input_data)
         hidden_data = nn.functional.relu(self.Layer1(input_data))
         output_data = self.Layer2(hidden_data)
+        
         return output_data
 
+
+#-----NEURAL NETWORK INITIALISATION-----#
+#Declare whether to sample properties based on their uncertainties, or just include the uncertainties as unique features
+sampled_uncertainties = True
+print("Using feature values sampled based on uncertainties: ", sampled_uncertainties)
+
 #Initialise the neural network instance for the model and guide
-input_nodes = 23
+if sampled_uncertainties:
+    input_nodes = 17
+else:
+    input_nodes = 23
 hidden_nodes = 64
 output_nodes = 2
 neural_network = ClassificationNeuralNetwork(input_nodes, hidden_nodes, output_nodes)
 
-def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0):
+
+def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0, sampled_uncertainties=sampled_uncertainties):
     '''
     Runs the model on the given input feature tensor, then sampling a classification from these logits
+    Optionally will use sampled values of uncertain features from a normal distribution with the std. being the feature's associated uncertainty
     
-    Inputs: Tensor of the input features to be passed into the neural network, 
+    Inputs: Tensor of the input features to be passed into the neural network
             *Optional* Tensor of the correct classifications
+            *Optional* Annealing factor - passed through from the guide, not used here
+            Boolean for whether to obtain samples from a normal distribution for features with uncertainties
+            
     Returns: Tensor of the actual correct labels itself (if passed into the function)
              Tensor of the sampled values from the calculated logits if not
     '''
-    logits = neural_network(input_features)
+    #print("Start of model:", input_features.shape)
+    input_features = torch.squeeze(input_features)
+    if sampled_uncertainties:
+        non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
+        #unc_inputs = [3,4, 5,6, 8,9, 11,12, 13,14, 20,21]
+        
+        with pyro.plate("uncertainties", input_features.shape[0]):
+            Flux1000 = pyro.sample("Flux1000", dist.Normal(input_features[:, 3], input_features[:, 4]))
+            Energy_Flux100 = pyro.sample("Energy_Flux100", dist.Normal(input_features[:, 5], input_features[:, 6]))
+            PL_Index = pyro.sample("PL_Index", dist.Normal(input_features[:, 8], input_features[:, 9]))
+            LP_Index = pyro.sample("LP_Index", dist.Normal(input_features[:, 11], input_features[:, 12]))
+            LP_beta = pyro.sample("LP_beta", dist.Normal(input_features[:, 13], input_features[:, 14]))
+            Frac_Variability = pyro.sample("Frac_Variability", dist.Normal(input_features[:, 20], input_features[:, 21]))
+                    
+        temp = torch.stack((Flux1000, Energy_Flux100, PL_Index, LP_Index, LP_beta, Frac_Variability))
+        temp = torch.transpose(temp, 0, 1)
+        
+        input_features_with_samples = torch.index_select(input_features, 1, torch.LongTensor(non_unc_inputs))
+        input_features_with_samples = torch.cat((input_features_with_samples, temp), dim=1)
+        
+        #print(input_features_with_samples[7, 12:])
+        logits = neural_network(input_features_with_samples)
+    
+    else:
+        logits = neural_network(input_features)
+        
     #with pyro.poutine.scale(None, anneal_factor):
+        
+    pyro.deterministic("probabilities", nn.functional.softmax(logits, dim=-1))
+    
     with pyro.plate("results", logits.shape[0]):
-        pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)    
+        pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)
     
 def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
     '''
     Samples the weights of the neural network from the global parameters
     The poutine.scale() applies the KL-annealing factor, allowing some burn-in for the parameters
-    Necessary since the priors being declared as standard normals isn't particularly accurate
+    Necessary since the priors being declared as standard normals may not be accurate - would like some freedom to roam
     
     Inputs: Tensor of the inputs features
             Tensor of the correct classification labels, optional KL-annealing strength factor
@@ -398,6 +446,33 @@ def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
         pyro.sample('Layer1.bias', dist.Normal(L1B_Mean, L1B_Std).independent(1))
         pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
         pyro.sample('Layer2.bias', dist.Normal(L2B_Mean, L2B_Std).independent(1))
+
+def UncertainValueSampling(input_tensor):
+    '''
+    Samples the uncertain features from a normal distribution of their observed value and their uncertainty
+    
+    Inputs: Tensor (dim: batch_size x 23) containing all of the input data
+    Outputs: Tensor (dim: batch_size x 17) - a reduced dataset with sampled values of the uncertain features
+    '''
+    non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
+    #unc_inputs = [3,4, 5,6, 8,9, 11,12, 13,14, 20,21]
+    
+    input_tensor = input_tensor.squeeze()
+
+    Flux1000 = torch.normal(input_tensor[:, 3], input_tensor[:, 4])
+    Energy_Flux100 = torch.normal(input_tensor[:, 5], input_tensor[:, 6])
+    PL_Index = torch.normal(input_tensor[:, 8], input_tensor[:, 9])
+    LP_Index = torch.normal(input_tensor[:, 11], input_tensor[:, 12])
+    LP_beta = torch.normal(input_tensor[:, 13], input_tensor[:, 14])
+    Frac_Variability = torch.normal(input_tensor[:, 20], input_tensor[:, 21])
+
+    temp = torch.stack((Flux1000, Energy_Flux100, PL_Index, LP_Index, LP_beta, Frac_Variability))
+    temp = torch.transpose(temp, 0, 1)
+    
+    output_tensor = torch.index_select(input_tensor, 1, torch.LongTensor(non_unc_inputs))
+    output_tensor = torch.cat((output_tensor, temp), dim=1)
+    
+    return output_tensor
 
 def DataTransformation(input_data, transformations):
     '''
@@ -571,7 +646,7 @@ val_data_array, val_class_array = test_data_array[split:], test_class_array[spli
 test_data_array, test_class_array = test_data_array[0:split], test_class_array[0:split]
 
 #Convert data arrays into Torch tensors and initialise DataLoaders 
-train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array, batch_size=16)
+train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array, batch_size=32)
 val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
@@ -591,14 +666,14 @@ def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
 
 def SVIMethod():
     #Run over a number of epochs (number of times to iterate through the dataset)
-    num_epochs = 1000
+    num_epochs = 2000
     temp_decay = 0.001**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
     #print(KL_annealing, temp_decay)
     
     #Define the network guide, network optimiser, and SVI training method
     guide = CustomGuide
     #guide = pyro.infer.autoguide.AutoNormal(ModelFunc)
-    adam = pyro.optim.ClippedAdam({'lr': 1e-3, 'lrd': temp_decay})
+    adam = pyro.optim.ClippedAdam({'lr': 2e-3, 'lrd': temp_decay})
     svi = SVI(ModelFunc, guide=guide, optim=adam, loss=Trace_ELBO(retain_graph=True))
     
     last_10_accuracies = np.zeros(10)+50
@@ -628,19 +703,25 @@ def SVIMethod():
         
         #Start the validation to test model accuracy after an epoch of training
         neural_network.eval()
-        current_val_data, current_val_class = next(iter(test_dataloader))
+        current_val_data, current_val_class = next(iter(val_dataloader))
         correct_number = np.zeros(current_val_class.shape[0])
         
         #Number of times to sample the predictions for each data point - higher number = less spread, but more computation time!
         sample_number = 200
         for sample in range(sample_number):
+            ##Need to sample values for uncertain features from their uncertainties and return a reduced dataset if using this method
+            if sampled_uncertainties:
+                temp_val_data = UncertainValueSampling(current_val_data)
+            else:
+                temp_val_data = current_val_data
+            
             #Sample the posterior weights and run the neural network on these
             guide_trace = pyro.poutine.trace(guide).get_trace(None, None)
             network_replay = pyro.poutine.replay(neural_network, trace=guide_trace)
             
             #Generates predictions from the network - no gradient tracking needed
             with torch.no_grad():
-                logits = network_replay(current_val_data)
+                logits = network_replay(temp_val_data)
                 probs = nn.functional.softmax(logits, dim=-1)
                 predictions = torch.argmax(probs, dim=-1)
                 #if epoch == 9:
@@ -657,95 +738,148 @@ def SVIMethod():
 
     return losses_array
 
-def MCMCMethod():
-    num_samples=1000
+def MCMCMethod(train_data, train_classes, num_samples):
+    '''
+    Runs the MCMC method on the provided training data and labels
+    Inputs:
+        Tensor containing the training data
+        Tensor containing the training labels
+        Int for the number of samples to draw for the MCMC run - with warmup included, twice as many samples are produced
+    Returns:
+        MCMC method object
+    '''
     nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
-    mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples)
-    mcmc.run(train_data_tensor, train_class_tensor)
-    
-    for i in range(20):
-        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
-        preds = predictive(val_data_tensor)
-        
-        correct_number=0
-        for x in range(num_samples):
-            correct_number += (preds['obs'][x].cpu().numpy() == val_class_tensor.cpu().numpy())
-        
-        #print(correct_number)
-        accuracy_rate = 100*(correct_number/num_samples)
-        print(np.mean(accuracy_rate))
+    mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples)#, warmup_steps=min(num_samples, 100))
+    mcmc.run(train_data, train_classes)
         
     return mcmc
 
-#losses_array = SVIMethod()
-mcmc = MCMCMethod()
+def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, run_number=10):
+    '''
+    Determines the accuracy of the model trained using MCMC by comparing model predictions on the test data to the true labels
+    Inputs:
+        MCMC method object - irrelevant if samples are passed into function
+        Tensor containing the test data
+        Tensor containing the test labels
+        *Optional* Dictionary containing the MCMC samples if already obtained, or None if samples not passed into MCMCPlotting function
+        *Optional* Int specifying the number of times to apply the samples to the provided test data
+    Returns:
+        Array containing the predicted labels for each object by each sample
+        Array containing the raw class probabilities for each object by each sample
+    '''
+    #Only want posterior samples for the network weights and biases - input variables should be resampled!
+    if samples_no_unc == None:
+        samples = mcmc.get_samples()
+        samples_no_unc = {}
+        network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
+        for x in network_keys:
+            samples_no_unc[x] = samples[x]
+        
+    for i in range(run_number):        
+        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=samples_no_unc, return_sites={"obs", "probabilities"})
+        output = predictive(test_data)
+        preds, probs = output['obs'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
+        
+        correct_number=0
+        for x in range(preds.shape[0]):
+            correct_number += (preds[x] == test_classes.cpu().numpy())
+        
+        #print(correct_number)
+        accuracy_rate = 100*(correct_number/preds.shape[0])
+        print(np.mean(accuracy_rate))
+        
+    return preds, probs
 
-#plt.scatter(np.linspace(1, 1000, 1000), np.log(losses_array), marker='x', color='black')
+def MCMCPlotting(mcmc, test_data, test_classes, samples=None):
+    '''
+    Produces some plots using the MCMC data (e.g: predicted labels histogram, trace plots of Layer 2 weights, entropy of predictions)
+    Inputs:
+        MCMC method object
+        Tensor containing the test data
+        Tensor containing the test labels
+        *Optional* Dictionary containing the MCMC samples if already obtained - just used to pass through to the MCMCAccuracy function (defaults to None if samples not provided)
+    '''
+    plots=True
+    
+    preds, probs = MCMCAccuracy(mcmc, test_data, test_classes, samples)
+        
+    fsrqs = np.where(test_classes.cpu().numpy() == 1)
+    blls = np.where(test_classes.cpu().numpy() == 0)
+    mean_pred = np.mean(preds, axis=0)
+    std_pred = np.std(preds, axis=0)
+    
+    mean_probs = np.zeros((probs.shape[1], 2))
+    for i in range(probs.shape[1]):
+        for j in range(2):
+            mean_probs[i, j] = np.mean(probs[:, i, j])
+    
+    if plots == True:
+        plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
+        plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
+        plt.plot([np.percentile(mean_pred[fsrqs], 20), np.percentile(mean_pred[fsrqs], 20)], [0,50], label="FSRQ 80th Percentile", ls = '--', color="Black")
+        plt.plot([np.percentile(mean_pred[blls], 80), np.percentile(mean_pred[blls], 80)], [0,50], label="BL Lac 80th Percentile", ls = '--', color="Magenta")
+        plt.xlabel("Mean prediction")
+        plt.ylabel("Box density")
+        plt.title("Mean prediction per object type (BL Lac = 0, FSRQ = 1)")
+        plt.legend()
+        plt.show()
+        
+        entropy = -((mean_pred*np.log(mean_pred+1e-9)) + ((1-mean_pred)*np.log(1-mean_pred+1e-9)))
+        
+        plt.hist(entropy, bins=50)
+        plt.title("Entropy of each object prediction")
+        plt.show()
+        
+        trace_params = mcmc.get_samples()['Layer2.weight'].cpu().numpy()
+        trace_params = np.array([trace_params])
+        az.plot_trace(trace_params)
+        plt.title("Posterior distributions for Layer 2 weights")
+        plt.show()
+           
+        plt.scatter(mean_pred, test_data[:, 14]) #PL_Index against uncertainty
+          
+#losses_array = SVIMethod()
+
+num_samples = 500 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples done in total
+cross_validation_k = 5
+
+train_data_split = torch.tensor_split(train_data_tensor, cross_validation_k)
+train_class_split = torch.tensor_split(train_class_tensor, cross_validation_k)
+
+list_mcmcs = []
+for run in range(cross_validation_k):
+    print(f"Run {run+1}")
+    temp_val_data = train_data_split[run]
+    temp_val_classes = train_class_split[run]
+    
+    temp_train_data = torch.cat(train_data_split[:run] + train_data_split[run+1:], dim=0)
+    temp_train_classes = torch.cat(train_class_split[:run] + train_class_split[run+1:], dim=0)
+        
+    mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
+    list_mcmcs.append(mcmc)
+    MCMCPlotting(mcmc, temp_val_data, temp_val_classes)
+    
+all_samples = {}
+network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
+for x in network_keys:
+    for j in range(len(list_mcmcs)):
+        mcmc = list_mcmcs[j]
+        if j == 0:
+            temp = mcmc.get_samples()[x]
+        else:
+            temp = torch.cat((temp, mcmc.get_samples()[x]), dim=0)
+        print("Hello:", temp.shape)
+        
+    all_samples[x] = temp
+
+MCMCPlotting(list_mcmcs[0], test_data_tensor, test_class_tensor, samples=all_samples)
+
+#plt.plot(np.linspace(0, len(losses_array)-1, len(losses_array)), losses_array)
 finish = time.time()
 print("Run time:", finish-start, "seconds")
+print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
 
-'''
-for i in range(5):
-    predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
-    preds = predictive(test_data_tensor)
-    correct_number=0
-    for x in range(preds['obs'].shape[0]):
-        correct_number += (preds['obs'][x].cpu().numpy() == test_class_tensor.cpu().numpy())
-    
-    #print(correct_number)
-    accuracy_rate = 100*(correct_number/preds['obs'].shape[0])
-    print(np.mean(accuracy_rate))
-'''
+#MCMCPlotting(mcmc)
 
-def MCMCPlotting(mcmc):
-    predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=mcmc.get_samples())
-    preds = predictive(test_data_tensor)
-    correct_number=0
-    for x in range(preds['obs'].shape[0]):
-        correct_number += (preds['obs'][x].cpu().numpy() == test_class_tensor.cpu().numpy())
-    
-    #print(correct_number)
-    accuracy_rate = 100*(correct_number/preds['obs'].shape[0])
-    print(np.mean(accuracy_rate))
-        
-    fsrqs = np.where(test_class_tensor.cpu().numpy() == 1)
-    blls = np.where(test_class_tensor.cpu().numpy() == 0)
-    mean_pred = np.mean(preds['obs'].cpu().numpy(), axis=0)
-    
-    plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
-    plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
-    plt.plot([np.percentile(mean_pred[fsrqs], 20), np.percentile(mean_pred[fsrqs], 20)], [0,50], label="FSRQ 80th Percentile", ls = '--', color="Black")
-    plt.plot([np.percentile(mean_pred[blls], 80), np.percentile(mean_pred[blls], 80)], [0,50], label="BL Lac 80th Percentile", ls = '--', color="Magenta")
-    plt.xlabel("Mean prediction")
-    plt.ylabel("Box density")
-    plt.title("Mean prediction per object type (BL Lac = 0, FSRQ = 1)")
-    plt.legend()
-    plt.show()
-    
-    entropy = -((mean_pred*np.log(mean_pred+1e-9)) + ((1-mean_pred)*np.log(1-mean_pred+1e-9)))
-    
-    plt.hist(entropy, bins=50)
-    plt.title("Entropy of each object prediction")
-    plt.show()
-    
-    trace_params = mcmc.get_samples()['Layer2.weight'].cpu().numpy()
-    trace_params = np.array([trace_params])
-    az.plot_trace(trace_params)
-    plt.title("Posterior distributions for Layer 2 weights")
-    plt.show()
-    
-    #plt.plot(mcmc.get_samples()['Layer1.weight'][:, 44, 13], marker='x', alpha=0.5)
-    #plt.show()
-    #plt.plot(mcmc.get_samples()['Layer1.weight'][:, 11, 18], marker='x', alpha=0.5)
-    #plt.show()
-    #plt.plot(mcmc.get_samples()['Layer2.weight'][:, 1, 13], alpha=0.5)
-    #plt.show()
-    #plt.plot(mcmc.get_samples()['Layer2.weight'][:, 0, 4], alpha=0.5)
-    #plt.show()
-    #plt.plot(mcmc.get_samples()['Layer2.bias'][:, 1], alpha=0.5)
-    #plt.show()
-    #plt.title("Sampled values of different weights/biases")
-    
-MCMCPlotting(mcmc)
 #time.sleep(10)
 #os.system("shutdown.exe /h")

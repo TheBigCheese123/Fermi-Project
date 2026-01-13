@@ -11,6 +11,7 @@ import matplotlib.cm
 import astropy
 from astropy.io import fits
 
+#4FGL-DR3 - gll_psc_v31.fit
 #4FGL-DR4 - gll_psc_v35.fit
 #4LAC-DR3 (high-altitude) - table-4LAC-DR3-h.fits
 
