@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 from pyro.nn import PyroModule, PyroSample, PyroParam
 from pyro.infer import SVI, Trace_ELBO, TraceGraph_ELBO
 import pyro.distributions as dist
+import sklearn.metrics
 
 #Functionally, makes sure that Pytorch and Pyro have been imported and linked correctly
 assert issubclass(PyroModule[nn.Linear], nn.Linear)
@@ -754,7 +755,7 @@ def MCMCMethod(train_data, train_classes, num_samples):
         
     return mcmc
 
-def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, run_number=10):
+def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, run_number=3):
     '''
     Determines the accuracy of the model trained using MCMC by comparing model predictions on the test data to the true labels
     Inputs:
@@ -767,6 +768,8 @@ def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, run_number=10):
         Array containing the predicted labels for each object by each sample
         Array containing the raw class probabilities for each object by each sample
     '''
+    test_classes = test_classes.cpu().numpy()
+    
     #Only want posterior samples for the network weights and biases - input variables should be resampled!
     if samples_no_unc == None:
         samples = mcmc.get_samples()
@@ -781,12 +784,15 @@ def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, run_number=10):
         preds, probs = output['obs'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
         
         correct_number=0
+        f1_score_total=0
         for x in range(preds.shape[0]):
-            correct_number += (preds[x] == test_classes.cpu().numpy())
+            correct_number += (preds[x] == test_classes)
+            f1_score_total += sklearn.metrics.f1_score(test_classes, preds[x])
         
         #print(correct_number)
         accuracy_rate = 100*(correct_number/preds.shape[0])
-        print(np.mean(accuracy_rate))
+        print("Accuracy rate:", np.mean(accuracy_rate), "%")
+        print("Average F1 score:", f1_score_total/preds.shape[0])
         
     return preds, probs
 
@@ -808,11 +814,11 @@ def MCMCPlotting(mcmc, test_data, test_classes, samples=None):
     mean_pred = np.mean(preds, axis=0)
     std_pred = np.std(preds, axis=0)
     
-    mean_probs = np.zeros((probs.shape[1], 2))
+    mean_probs = np.zeros((probs.shape[1], 2))    
     for i in range(probs.shape[1]):
         for j in range(2):
             mean_probs[i, j] = np.mean(probs[:, i, j])
-    
+                
     if plots == True:
         plt.hist(mean_pred[fsrqs], bins=10, label="FSRQs", color='red', alpha=0.7)
         plt.hist(mean_pred[blls], bins=10, label="BL Lacs", color='blue', alpha=0.7)
@@ -835,9 +841,39 @@ def MCMCPlotting(mcmc, test_data, test_classes, samples=None):
         az.plot_trace(trace_params)
         plt.title("Posterior distributions for Layer 2 weights")
         plt.show()
-           
-        plt.scatter(mean_pred, test_data[:, 14]) #PL_Index against uncertainty
+        
+        fpr, tpr, thresholds = sklearn.metrics.roc_curve(test_classes, mean_probs[:, 1])
+        auc_score = sklearn.metrics.roc_auc_score(test_classes, mean_probs[:, 1])
+        plt.plot(fpr, tpr, label='ROC Curve for model')
+        plt.plot([0, 1], [0, 1], ls='--', color='gray', alpha=0.6, label='Random guesses curve')
+        plt.xlabel("False Positive Rate (FPR)")
+        plt.ylabel("True Positive Rate (TPR)")
+        plt.title(f"ROC curve for model; AUC score = {auc_score:.3f}")
+        plt.legend()
+        plt.show()
+        
+        plt.scatter(np.mean(probs[:, :, 1], axis=0), np.std(probs[:, :, 1], axis=0), color='red', marker='x')
+        plt.title("Uncertainty (standard deviation) in FSRQ probability against mean FSRQ probability per object")
+        plt.xlabel("Mean FSRQ probability")
+        plt.ylabel("Uncertainty in FSRQ probability")
+        plt.show()
+        '''
+        plt.scatter(np.mean(probs[:, :, 0], axis=0), np.std(probs[:, :, 0], axis=0), color='blue', marker='x')
+        plt.title("Uncertainty (standard deviation) in BLL probability against mean BLL probability per object")
+        plt.xlabel("Mean BLL probability")
+        plt.ylabel("Uncertainty in BLL probability")
+        plt.show()
+        '''
+        #plt.scatter(mean_pred, test_data[:, 14]) #PL_Index against uncertainty
           
+def SaveSamples(sample_dictionary, file_name='temp_samples_dict.npy'):
+    print(f"Saving samples to file {file_name}")
+    np.save(f'temp_samples_dict.npy', all_samples)
+    
+def LoadSamples(file_name):
+    print(f"Loading samples from file {file_name}")
+    return np.load(f'{file_name}', allow_pickle=True).item()
+        
 #losses_array = SVIMethod()
 
 num_samples = 500 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples done in total
@@ -846,6 +882,7 @@ cross_validation_k = 5
 train_data_split = torch.tensor_split(train_data_tensor, cross_validation_k)
 train_class_split = torch.tensor_split(train_class_tensor, cross_validation_k)
 
+#CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
 list_mcmcs = []
 for run in range(cross_validation_k):
     print(f"Run {run+1}")
@@ -855,10 +892,11 @@ for run in range(cross_validation_k):
     temp_train_data = torch.cat(train_data_split[:run] + train_data_split[run+1:], dim=0)
     temp_train_classes = torch.cat(train_class_split[:run] + train_class_split[run+1:], dim=0)
         
-    mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
-    list_mcmcs.append(mcmc)
-    MCMCPlotting(mcmc, temp_val_data, temp_val_classes)
-    
+    #mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
+    #list_mcmcs.append(mcmc)
+    MCMCPlotting(list_mcmcs[run], temp_val_data, temp_val_classes)
+
+#Combine the samples from each fold into one large dictionary    
 all_samples = {}
 network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
 for x in network_keys:
@@ -872,14 +910,21 @@ for x in network_keys:
         
     all_samples[x] = temp
 
-MCMCPlotting(list_mcmcs[0], test_data_tensor, test_class_tensor, samples=all_samples)
+#MCMCPlotting(list_mcmcs[0], test_data_tensor, test_class_tensor)#, samples=all_samples)
+
+for number in range(len(list_mcmcs)):
+    print(f"Model {number+1}")
+    MCMCPlotting(list_mcmcs[number], test_data_tensor, test_class_tensor)
+    
+MCMCPlotting(list_mcmcs[2], test_data_tensor, test_class_tensor, samples=all_samples)
 
 #plt.plot(np.linspace(0, len(losses_array)-1, len(losses_array)), losses_array)
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
 
-#MCMCPlotting(mcmc)
+SaveSamples(all_samples, file_name='temp_samples_dict.npy')
+#loaded_samples = LoadSamples('temp_samples_dict.npy')
 
 #time.sleep(10)
 #os.system("shutdown.exe /h")
