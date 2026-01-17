@@ -638,17 +638,18 @@ for x in range(train_data_array.shape[1]):
 '''
 
 #Further split into training set, testing set, and validation set - 80% training set, 10% each validation and test sets
+#COMMENTED OUT VALIDATION SPLITS SINCE WE USE K-FOLD CROSS-VALIDATION - NO NEED FOR SEPARATE VALIDATION SET
 split = int(round(0.8 * len(train_data_array)))
 test_data_array, test_class_array = train_data_array[split:], train_class_array[split:]
 train_data_array, train_class_array = train_data_array[0:split], train_class_array[0:split]
 
-split = int(round(0.5 * len(test_data_array)))
-val_data_array, val_class_array = test_data_array[split:], test_class_array[split:]
-test_data_array, test_class_array = test_data_array[0:split], test_class_array[0:split]
+#split = int(round(0.5 * len(test_data_array)))
+#val_data_array, val_class_array = test_data_array[split:], test_class_array[split:]
+#test_data_array, test_class_array = test_data_array[0:split], test_class_array[0:split]
 
 #Convert data arrays into Torch tensors and initialise DataLoaders 
 train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array, batch_size=32)
-val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
+#val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
 ## NEURAL NETWORK TRAINING PROCESS ##
@@ -876,9 +877,9 @@ def LoadSamples(file_name):
         
 #losses_array = SVIMethod()
 
-num_samples = 500 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples done in total
+num_samples = 20 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples done in total
 cross_validation_k = 5
-
+'''
 train_data_split = torch.tensor_split(train_data_tensor, cross_validation_k)
 train_class_split = torch.tensor_split(train_class_tensor, cross_validation_k)
 
@@ -895,6 +896,23 @@ for run in range(cross_validation_k):
     #mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
     #list_mcmcs.append(mcmc)
     MCMCPlotting(list_mcmcs[run], temp_val_data, temp_val_classes)
+'''
+
+#CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
+list_mcmcs = []
+skf = sklearn.model_selection.StratifiedKFold(cross_validation_k) #Stratified K-fold CV keeps class compositions equal between fold splits
+
+for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, train_class_tensor)):
+    print(f"Fold {fold+1}")
+    temp_val_data = train_data_tensor[test_data]
+    temp_val_classes = train_class_tensor[test_data]
+    
+    temp_train_data = train_data_tensor[train_data]
+    temp_train_classes = train_class_tensor[train_data]
+        
+    mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
+    list_mcmcs.append(mcmc)
+    MCMCPlotting(list_mcmcs[fold], temp_val_data, temp_val_classes)
 
 #Combine the samples from each fold into one large dictionary    
 all_samples = {}
@@ -923,7 +941,7 @@ finish = time.time()
 print("Run time:", finish-start, "seconds")
 print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
 
-SaveSamples(all_samples, file_name='temp_samples_dict.npy')
+#SaveSamples(all_samples, file_name='temp_samples_dict.npy')
 #loaded_samples = LoadSamples('temp_samples_dict.npy')
 
 #time.sleep(10)
