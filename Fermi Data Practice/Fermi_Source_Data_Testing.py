@@ -76,3 +76,5 @@ plt.title("Sources (|b| > 10 degrees) present in the 4LAC-DR3 catalog (red=FSRQ,
 
 #cbar = plt.colorbar(mapper, ax=ax, ticks=range(len(AGN_labels_unique)), label='Class')
 #cbar.ax.set_yticklabels(AGN_labels_unique)
+
+print(np.unique(AGN_labels_full, return_counts=True))
