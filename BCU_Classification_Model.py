@@ -1045,38 +1045,6 @@ else:
 all_samples_class = ListMergingAndTrimmingMCMCs(list_mcmcs_class)
 #all_samples_class = LoadSamples('temp_samples_class_dict.npy')
 
-#Training data reduction
-overflow_preds, train_class_mean_probs = ClassMCMCAccuracy(train_data_tensor, train_class_tensor, all_samples_class, return_metrics=False, run_number=1)
-train_class_mean_probs_tensor = torch.tensor(np.mean(train_class_mean_probs[:, :, 1], axis=0))
-redshift_train_data_tensor = torch.cat((train_data_tensor, train_class_mean_probs_tensor.unsqueeze(1)), dim=1)
-
-known_redshift_indices = np.where(train_redshift_array != -np.inf)
-redshift_train_data_tensor = redshift_train_data_tensor[known_redshift_indices, :]
-train_redshift_tensor = torch.tensor(train_redshift_array[known_redshift_indices])
-
-
-#Testing data reduction
-overflow_preds_test, test_class_mean_probs = ClassMCMCAccuracy(test_data_tensor, test_class_tensor, all_samples_class, return_metrics=False, run_number=1)
-test_class_mean_probs_tensor = torch.tensor(np.mean(test_class_mean_probs[:, :, 1], axis=0))
-redshift_test_data_tensor = torch.cat((test_data_tensor, test_class_mean_probs_tensor.unsqueeze(1)), dim=1)
-
-known_redshift_indices_test = np.where(test_redshift_array != -np.inf)
-redshift_test_data_tensor = redshift_test_data_tensor[known_redshift_indices_test, :]
-test_redshift_tensor = torch.tensor(test_redshift_array[known_redshift_indices_test])
-
-
-#BCU data reduction
-bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class, plots=False)
-bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
-bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
-
-known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
-known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
-known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
-#known_bcu_data_tensor = torch.squeeze(known_bcu_data_tensor)
-#print(known_bcu_data_tensor.shape)
-#print(known_bcu_class_mean_probs)
-
 def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples, plots=False):
     predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, posterior_samples=samples, return_sites={"obs_redshift", "sigma"})
     output = predictive(input_data_tensor)
@@ -1113,20 +1081,78 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples, plots=Fa
         plt.legend()
         plt.show()
 
+def DataFormattingForRedshifts(input_data_tensor, input_class_tensor, input_redshift_array, class_samples):
+    preds, probs = ClassMCMCAccuracy(input_data_tensor, input_class_tensor, class_samples, return_metrics=False, run_number=1)
+    mean_probs_tensor = torch.tensor(np.mean(probs[:, :, 1], axis=0)) #Taking FSRQ probabilities as inputs
+    temp_data_tensor = torch.cat((input_data_tensor, mean_probs_tensor.unsqueeze(1)), dim=1)
+
+    known_redshift_indices = np.where(input_redshift_array != -np.inf)
+    data_tensor_for_redshifts = temp_data_tensor[known_redshift_indices, :]
+    known_redshifts_tensor = torch.tensor(input_redshift_array[known_redshift_indices])
+    
+    return data_tensor_for_redshifts, known_redshifts_tensor
+    
+'''
+#Training data reduction
+overflow_preds, train_class_mean_probs = ClassMCMCAccuracy(train_data_tensor, train_class_tensor, all_samples_class, return_metrics=False, run_number=1)
+train_class_mean_probs_tensor = torch.tensor(np.mean(train_class_mean_probs[:, :, 1], axis=0))
+redshift_train_data_tensor = torch.cat((train_data_tensor, train_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_redshift_indices = np.where(train_redshift_array != -np.inf)
+redshift_train_data_tensor = redshift_train_data_tensor[known_redshift_indices, :]
+train_redshift_tensor = torch.tensor(train_redshift_array[known_redshift_indices])
+
+
+#Testing data reduction
+overflow_preds_test, test_class_mean_probs = ClassMCMCAccuracy(test_data_tensor, test_class_tensor, all_samples_class, return_metrics=False, run_number=1)
+test_class_mean_probs_tensor = torch.tensor(np.mean(test_class_mean_probs[:, :, 1], axis=0))
+redshift_test_data_tensor = torch.cat((test_data_tensor, test_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_redshift_indices_test = np.where(test_redshift_array != -np.inf)
+redshift_test_data_tensor = redshift_test_data_tensor[known_redshift_indices_test, :]
+test_redshift_tensor = torch.tensor(test_redshift_array[known_redshift_indices_test])
+
+
+#BCU data reduction
+bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class, plots=False)
+bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
+bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
+known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
+known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
+#known_bcu_data_tensor = torch.squeeze(known_bcu_data_tensor)
+#print(known_bcu_data_tensor.shape)
+#print(known_bcu_class_mean_probs)
+'''
+
+train_data_tensor_redshifts, train_redshifts_tensor = DataFormattingForRedshifts(train_data_tensor, train_class_tensor, train_redshift_array, all_samples_class)
+test_data_tensor_redshifts, test_redshifts_tensor = DataFormattingForRedshifts(test_data_tensor, test_class_tensor, test_redshift_array, all_samples_class)
+
+#BCU data reduction
+bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class, plots=False)
+bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
+bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
+known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
+known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
+
+
 list_mcmcs_redshift = []
 #Only attempts to run the redshift predictions when the full dataset has been used in training for classifications        
 if cross_validation_k_class == 1:
-    mcmc = MCMCMethod(redshift_train_data_tensor, train_redshift_tensor, num_samples, RedshiftsModelFunc)
+    mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples, RedshiftsModelFunc)
     list_mcmcs_redshift.append(mcmc)
     
     all_samples_redshift = ListMergingAndTrimmingMCMCs(list_mcmcs_redshift)
     #all_samples_redshift = LoadSamples('temp_samples_redshift_dict.npy')
     
     #Training data predictions
-    RedshiftPlotting(redshift_train_data_tensor, train_redshift_tensor, all_samples_redshift, plots=True)
+    RedshiftPlotting(train_data_tensor_redshifts, train_redshifts_tensor, all_samples_redshift, plots=True)
     
     #Test data predictions
-    RedshiftPlotting(redshift_test_data_tensor, test_redshift_tensor, all_samples_redshift, plots=True)
+    RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, all_samples_redshift, plots=True)
     
     #BCU Predictions
     RedshiftPlotting(known_bcu_data_tensor, known_bcu_redshifts_tensor, all_samples_redshift, plots=True)
