@@ -61,7 +61,9 @@ features_master_list = [
                         "TTYPE38",            #Variability_Index
                         "TTYPE39", "TTYPE40", #Frac_Variability + unc. ***874 are missing data (i.e: value 0 for frac_var, value 10.0 for unc.)***
                         "TTYPE41",            #Highest_energy, ***1286 are missing data***
-                        "TTYPE21"             #Classification - DO NOT USE TO TRAIN NETWORK!!!
+                        "TTYPE21",            #Classification - TRAINING LABEL, NOT AN INPUT
+                        "TTYPE30",            #Redshift - TRAINING VALUE, NOT AN INPUT ***1601 are missing data***
+                        "TTYPE1"              #Source_Name - UNIQUE OBJECT IDENTIFIER, NOT AN INPUT
                         ]
 
 #CONSIDER ADDING TTYPE32/33 AND TTYPE34/35 - HE_EPeak+unc. and HE_nuFnuPeak+unc. columns
@@ -83,6 +85,8 @@ transformations = [
                     "Log+Z",
                     "Log",
                     "Log+Z", "Propagate",
+                    "Log+Z",
+                    "None",
                     "Log+Z",
                     "None"
                     ]
@@ -210,20 +214,18 @@ def ClassificationFiltering(input_master_array):
     '''
     class_feature = "CLASS"
     filtered_array = input_master_array
-    
-    #print(filtered_array["CLASS"][0:50])
-    
+        
     for i in range(len(filtered_array)):
         class_temp = filtered_array[class_feature][i]
         class_temp = class_temp.lower()
         
-        if (class_temp != 'fsrq') and (class_temp != 'bll'):
+        if (class_temp != 'fsrq') and (class_temp != 'bll') and (class_temp != 'bcu'):
             class_temp = 'inval'
             
         filtered_array[class_feature][i] = class_temp
         
     filtered_array = filtered_array[filtered_array[class_feature] != 'inval']
-    #print(filtered_array["CLASS"][0:50])
+    filtered_array = filtered_array[filtered_array[class_feature] != 'bcu']
     
     return filtered_array
 
@@ -295,12 +297,12 @@ def SEDClassFormatting(input_master_array):
     
     return filtered_array
 
-class ClassificationNeuralNetwork(PyroModule[nn.Module]):
+class BayesianNeuralNetwork(PyroModule[nn.Module]):
     '''
-    Defines the Bayesian Neural Network that we use for the classification of BCUs
+    Defines the Bayesian Neural Network that we use for the classification of BCUs and for the redshift predictions
     Declared as a PyroModule mixin class of nn.Module
     
-    __init__: Initialises the network with the network layer sizes and declares the Pyro objects to give the Bayesian behaviour
+    __init__: Initialises the network with the given network layer sizes and declares the Pyro objects to give the Bayesian behaviour
     forward: Called whenever the network is 'run', we apply the network transformations to the inputs in order and return the outputs
     '''
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -358,30 +360,34 @@ class ClassificationNeuralNetwork(PyroModule[nn.Module]):
 sampled_uncertainties = True
 print("Using feature values sampled based on uncertainties: ", sampled_uncertainties)
 
-#Initialise the neural network instance for the model and guide
+#Define network node sizes, and create a neural network instance for classification plus one for redshift predictions
 global_std_scale = -1 #Determines the size of the Gaussian priors for weights and biases
 
 if sampled_uncertainties:
-    input_nodes = 17
+    input_nodes_classification = 17
+    input_nodes_redshifts = 18 #Same inputs as classification plus the class probability
 else:
-    input_nodes = 23
-hidden_nodes = 32
-output_nodes = 2
+    input_nodes_classification = 23
+    input_nodes_redshifts = 24
+    
+hidden_nodes_classification = 32
+hidden_nodes_redshifts = 32
 
-print(f"Using {hidden_nodes} hidden nodes, and a log prior width of {global_std_scale}")
+output_nodes_classification = 2
+output_nodes_redshifts = 1
 
-neural_network = ClassificationNeuralNetwork(input_nodes, hidden_nodes, output_nodes)
+print(f"Using {hidden_nodes_classification} hidden nodes for classifier, {hidden_nodes_redshifts} hidden nodes for redshift predictor, and a log prior width of {global_std_scale}")
 
+classification_neural_network = BayesianNeuralNetwork(input_nodes_classification, hidden_nodes_classification, output_nodes_classification)
+redshifts_neural_network = BayesianNeuralNetwork(input_nodes_redshifts, hidden_nodes_redshifts, output_nodes_redshifts)
 
-def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0, sampled_uncertainties=sampled_uncertainties):
+def ClassificationModelFunc(input_features, correct_labels=None, sampled_uncertainties=sampled_uncertainties):
     '''
     Runs the model on the given input feature tensor, then sampling a classification from these logits
-    Optionally will use sampled values of uncertain features from a normal distribution with the std. being the feature's associated uncertainty
-    
+    Optionally, will call UncertaintySampling to obtain sampled values of uncertain features from a normal distribution with the std. being the feature's associated uncertainty
     Inputs: Tensor of the input features to be passed into the neural network
             *Optional* Tensor of the correct classifications
-            *Optional* Annealing factor - passed through from the guide, not used here
-            Boolean for whether to obtain samples from a normal distribution for features with uncertainties
+            Boolean for whether to obtain samples from a normal distribution for features with uncertainties - defined at start of code
             
     Returns: Tensor of the actual correct labels itself (if passed into the function)
              Tensor of the sampled values from the calculated logits if not
@@ -389,9 +395,56 @@ def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0, sampled_un
     #print("Start of model:", input_features.shape)
     input_features = torch.squeeze(input_features)
     if sampled_uncertainties:
-        non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
-        #unc_inputs = [3,4, 5,6, 8,9, 11,12, 13,14, 20,21]
+        input_features_with_samples = UncertaintySampling(input_features)
         
+        #print(input_features_with_samples[7, 12:])
+        logits = classification_neural_network(input_features_with_samples)
+    
+    else:
+        logits = classification_neural_network(input_features)
+                
+    pyro.deterministic("probabilities", nn.functional.softmax(logits, dim=-1))
+    with pyro.plate("results_class", logits.shape[0]):
+        pyro.sample("obs_class", dist.Categorical(logits=logits), obs=correct_labels)
+
+def RedshiftsModelFunc(input_features, correct_redshifts=None, sampled_uncertainties=sampled_uncertainties):
+    '''
+    Runs the model on the given input feature tensor, then sampling a redshift value from these logits
+    Optionally, will call UncertaintySampling to obtain sampled values of uncertain features from a normal distribution with the std. being the feature's associated uncertainty
+    Inputs: Tensor of the input features to be passed into the neural network
+            *Optional* Tensor of the correct redshift values
+            Boolean for whether to obtain samples from a normal distribution for features with uncertainties - defined at start of code
+            
+    Returns: Tensor of the actual correct labels itself (if passed into the function)
+             Tensor of the sampled values from the calculated logits if not
+    '''
+    #print("Start of model:", input_features.shape)
+    input_features = torch.squeeze(input_features)
+    if sampled_uncertainties:
+        input_features_with_samples = UncertaintySampling(input_features, redshifts=True)
+        
+        #print(input_features_with_samples[7, 12:])
+        predictions = redshifts_neural_network(input_features_with_samples)
+    
+    else:
+        predictions = redshifts_neural_network(input_features)
+
+    estimated_noise_scale = 0.0005 #Noise injected into predictions - very low value treats redshift predictions as a point-prediction
+    noise_levels = pyro.sample("sigma", dist.HalfNormal(estimated_noise_scale))
+    predictions = predictions.flatten()
+
+    with pyro.plate("results_redshift", predictions.shape[0]):
+        pyro.sample("obs_redshift", dist.Normal(predictions, noise_levels), obs=correct_redshifts)
+    return predictions
+
+def UncertaintySampling(input_features, redshifts=False):
+        if redshifts:
+            non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22, 23]
+        else:
+            non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
+            
+        #unc_inputs = [3,4, 5,6, 8,9, 11,12, 13,14, 20,21]
+
         with pyro.plate("uncertainties", input_features.shape[0]):
             Flux1000 = pyro.sample("Flux1000", dist.Normal(input_features[:, 3], input_features[:, 4]))
             Energy_Flux100 = pyro.sample("Energy_Flux100", dist.Normal(input_features[:, 5], input_features[:, 6]))
@@ -399,95 +452,20 @@ def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0, sampled_un
             LP_Index = pyro.sample("LP_Index", dist.Normal(input_features[:, 11], input_features[:, 12]))
             LP_beta = pyro.sample("LP_beta", dist.Normal(input_features[:, 13], input_features[:, 14]))
             Frac_Variability = pyro.sample("Frac_Variability", dist.Normal(input_features[:, 20], input_features[:, 21]))
-        
+                
         temp = torch.stack((Flux1000, Energy_Flux100, PL_Index, LP_Index, LP_beta, Frac_Variability))
         temp = torch.transpose(temp, 0, 1)
         
         input_features_with_samples = torch.index_select(input_features, 1, torch.LongTensor(non_unc_inputs))
         input_features_with_samples = torch.cat((input_features_with_samples, temp), dim=1)
-        
-        #print(input_features_with_samples[7, 12:])
-        logits = neural_network(input_features_with_samples)
-    
-    else:
-        logits = neural_network(input_features)
-        
-    #with pyro.poutine.scale(None, anneal_factor):
-        
-    pyro.deterministic("probabilities", nn.functional.softmax(logits, dim=-1))
-    
-    with pyro.plate("results", logits.shape[0]):
-        pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)
-    
-def CustomGuide(input_features, correct_labels, anneal_factor=1.0):
-    '''
-    Samples the weights of the neural network from the global parameters
-    The poutine.scale() applies the KL-annealing factor, allowing some burn-in for the parameters
-    Necessary since the priors being declared as standard normals may not be accurate - would like some freedom to roam
-    
-    Inputs: Tensor of the inputs features
-            Tensor of the correct classification labels, optional KL-annealing strength factor
-    '''
-    
-    #Scales the log_std size (e.g: a value of 0 means stds of e^0 = 1)
-    std_scale = global_std_scale
-    
-    #Local copies of the global weight distribution parameters
-    L1W_Mean = pyro.param('L1WMean', torch.zeros_like(neural_network.Layer1.weight))
-    L1W_LogStd = pyro.param('L1WLogStd', std_scale*torch.ones_like(neural_network.Layer1.weight))
-    L1W_Std = torch.exp(L1W_LogStd)
-    
-    L1B_Mean = pyro.param('L1BMean', torch.zeros_like(neural_network.Layer1.bias))
-    L1B_LogStd = pyro.param('L1BLogStd', std_scale*torch.ones_like(neural_network.Layer1.bias))
-    L1B_Std = torch.exp(L1B_LogStd)
-        
-    L2W_Mean = pyro.param('L2WMean', torch.zeros_like(neural_network.Layer2.weight))
-    L2W_LogStd = pyro.param('L2WLogStd', std_scale*torch.ones_like(neural_network.Layer2.weight))
-    L2W_Std = torch.exp(L2W_LogStd)
-    
-    L2B_Mean = pyro.param('L2BMean', torch.zeros_like(neural_network.Layer2.bias))
-    L2B_LogStd = pyro.param('L2BLogStd', std_scale*torch.ones_like(neural_network.Layer2.bias))
-    L2B_Std = torch.exp(L2B_LogStd)
-    
-    #New weights and biases are sampled with these local parameters
-    with pyro.poutine.scale(None, anneal_factor):
-        pyro.sample('Layer1.weight', dist.Normal(L1W_Mean, L1W_Std).independent(2))
-        pyro.sample('Layer1.bias', dist.Normal(L1B_Mean, L1B_Std).independent(1))
-        pyro.sample('Layer2.weight', dist.Normal(L2W_Mean, L2W_Std).independent(2))
-        pyro.sample('Layer2.bias', dist.Normal(L2B_Mean, L2B_Std).independent(1))
 
-def UncertainValueSampling(input_tensor):
-    '''
-    Samples the uncertain features from a normal distribution of their observed value and their uncertainty
+        return input_features_with_samples
     
-    Inputs: Tensor (dim: batch_size x 23) containing all of the input data
-    Outputs: Tensor (dim: batch_size x 17) - a reduced dataset with sampled values of the uncertain features
-    '''
-    non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
-    #unc_inputs = [3,4, 5,6, 8,9, 11,12, 13,14, 20,21]
-    
-    input_tensor = input_tensor.squeeze()
-
-    Flux1000 = torch.normal(input_tensor[:, 3], input_tensor[:, 4])
-    Energy_Flux100 = torch.normal(input_tensor[:, 5], input_tensor[:, 6])
-    PL_Index = torch.normal(input_tensor[:, 8], input_tensor[:, 9])
-    LP_Index = torch.normal(input_tensor[:, 11], input_tensor[:, 12])
-    LP_beta = torch.normal(input_tensor[:, 13], input_tensor[:, 14])
-    Frac_Variability = torch.normal(input_tensor[:, 20], input_tensor[:, 21])
-
-    temp = torch.stack((Flux1000, Energy_Flux100, PL_Index, LP_Index, LP_beta, Frac_Variability))
-    temp = torch.transpose(temp, 0, 1)
-    
-    output_tensor = torch.index_select(input_tensor, 1, torch.LongTensor(non_unc_inputs))
-    output_tensor = torch.cat((output_tensor, temp), dim=1)
-    
-    return output_tensor
-
 def DataTransformation(input_data, transformations, zscore_means=None, zscore_stds=None):
     '''
     Normalises and scales our features based on the requested transformation list (defined at the program start)
     Master function checks each transformation method, and passes those features to the correct transformation function 
-    Z-score means and stds from training dataset can be passed in if transforming test dataset, to avoid information leakage that can affect the training process
+    Z-score means and stds from training dataset can be passed in when separately transforming test dataset (separately transformed to avoid information leakage about test data)
     Inputs: Array containing the input data to be transformed
             Array containing the transformation methods to be used for each feature
             *Optional* Float array containing the z-score means to be applied (if transforming test dataset), or None (if transforming training dataset)
@@ -534,7 +512,7 @@ def DataTransformation(input_data, transformations, zscore_means=None, zscore_st
             #Performs both log and z-score transforms on data and uncertainties
             elif method == "Log+Z":
                 temp_array, temp_prop_array = DataLogTransform(temp_array, temp_prop_array)
-                temp_array, temp_prop_array, temp_zscore_mean, temp_zscore_std = DataZScoring(temp_array, temp_prop_array, temp_zscore_mean, temp_zscore_std)
+                temp_array, temp_prop_array, temp_zscore_mean, temp_zscore_std = DataZScoring(temp_array, temp_prop_array, temp_zscore_mean, temp_zscore_std)                
     
             elif i==0: #Scales the GLON coordinate
                 temp_array = (temp_array-180)/180
@@ -621,11 +599,16 @@ master_data_array = SEDClassFormatting(master_data_array)
 
 ## TRAINING DATA CREATION ##
 #Filter out non-relevant classifications for training set (FSRQs and BL Lacs)
+print(np.unique(master_data_array["CLASS"]))
 temp_data_array = ClassificationFiltering(master_data_array)
+print(np.unique(master_data_array["CLASS"]))
 
 #Split master data into network training data and classification "correct answers"
-train_data_array = np.zeros((len(temp_data_array), len(features_master_list)-1), dtype=np.float32)
+#Also splits off the source names and the redshifts into separate arrays
+train_data_array = np.zeros((len(temp_data_array), len(features_master_list)-3), dtype=np.float32)
 train_class_array = np.array(len(temp_data_array), dtype=str)
+train_redshift_array_temp = np.array(len(temp_data_array), dtype=np.float32)
+train_source_name_array = np.array(len(temp_data_array), dtype=str)
 
 for i in range(len(features_master_list)):
     feature = master_headers_array[features_master_list[i]]
@@ -638,22 +621,33 @@ for i in range(len(features_master_list)):
         train_class_array[train_class_array == 'bll'] = 0
         train_class_array = np.asarray(train_class_array, dtype=int)
         
+    elif i==24: #Splits off the redshift array - also have to swap the byte order from 'big-endian' to 'little-endian'
+        train_redshift_array_temp = temp_data_array[feature]
+        train_redshift_array = train_redshift_array_temp.byteswap().view(train_redshift_array_temp.dtype.newbyteorder('='))
+    
+    elif i==25: #Splits off the Source_Name array
+        train_source_name_array = temp_data_array[feature]
+        
     else:
         train_data_array[:, i] = temp_data_array[feature]
 
-#Makes sure that the data and classes have been split into correctly-sized arrays, then shuffles them (whilst maintaining correspondence)
+#Makes sure that the data, classes, redshift and source names have been split into correctly-sized arrays, then shuffles them (whilst maintaining correspondence)
 assert len(train_data_array) == len(train_class_array)
-#print(train_data_array[[899, 639, 751, 812, 652], 0], train_class_array[[899, 639, 751, 812, 652]]) #For verifying rng_seed=1234
+#print(train_data_array[[899, 639, 751, 812, 652], 0], train_class_array[[899, 639, 751, 812, 652]], train_redshift_array[[899, 639, 751, 812, 652]], train_source_name_array[[899, 639, 751, 812, 652]]) #For verifying permutations are working correctly 
+
 shuffled_indices = np.random.permutation(len(train_data_array))
 train_data_array = train_data_array[shuffled_indices]
 train_class_array = train_class_array[shuffled_indices]
-#print(shuffled_indices[2:7], train_data_array[2:7, 0], train_class_array[2:7]) #For verifying rng_seed=1234
+train_redshift_array = train_redshift_array[shuffled_indices]
+train_source_name_array = train_source_name_array[shuffled_indices]
+
+#print(shuffled_indices[2:7], train_data_array[2:7, 0], train_class_array[2:7], train_redshift_array[2:7], train_source_name_array[2:7]) #For verifying permutations are working correctly - for rng_seed=1234, should match previous print perfectly
 
 #Split into training set, testing set, and validation set - 80% training set, 20% test set
 #No need for validation set since we use k-fold cross-validation
 split = int(round(0.8 * len(train_data_array)))
-test_data_array, test_class_array = train_data_array[split:], train_class_array[split:]
-train_data_array, train_class_array = train_data_array[0:split], train_class_array[0:split]
+test_data_array, test_class_array, test_redshift_array, test_source_name_array = train_data_array[split:], train_class_array[split:], train_redshift_array[split:], train_source_name_array[split:]
+train_data_array, train_class_array, train_redshift_array, train_source_name_array = train_data_array[0:split], train_class_array[0:split], train_redshift_array[0:split], train_source_name_array[0:split]
 
 #Need to use the z-scoring means and stds for the training dataset to transform the test dataset, otherwise model can learn information about the test dataset during training!
 untransformed_train_array = train_data_array
@@ -680,124 +674,41 @@ train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
 
 ## NEURAL NETWORK TRAINING PROCESS ##
-def Sigmoid(epoch, total_epochs, ramp_factor=1/20):
+def MCMCMethod(train_data, train_labels, num_samples, ModelFunc):
     '''
-    Applies a sigmoid function to the current epoch to find the KL annealing factor
-    Starts small, quickly ramps up midway through training, high value towards the end of training
-    Inputs: Int for the current epoch
-            Int for the total number of epochs
-            *Optional* Float to scale the effective midpoint; changing this changes how early the KL annealing "ramp-up" happens
-    Outputs: Float for the KL annealing factor to use for the current epoch
-    *Note that ramp_factor and the "-0.1" in the exponential are tuneable hyperparameters for the profile of the sigmoid function*
-    '''
-    sigmoid_midpoint = ramp_factor * total_epochs
-    return 1/(1 + np.exp(-0.01 * (epoch-sigmoid_midpoint)))
-'''
-def SVIMethod():
-    #Run over a number of epochs (number of times to iterate through the dataset)
-    num_epochs = 2000
-    temp_decay = 0.001**(1/(54*num_epochs)) #Final learning rate is 0.01*initial learning rate
-    #print(KL_annealing, temp_decay)
-    
-    #Define the network guide, network optimiser, and SVI training method
-    guide = CustomGuide
-    #guide = pyro.infer.autoguide.AutoNormal(ModelFunc)
-    adam = pyro.optim.ClippedAdam({'lr': 2e-3, 'lrd': temp_decay})
-    svi = SVI(ModelFunc, guide=guide, optim=adam, loss=Trace_ELBO(retain_graph=True))
-    
-    last_10_accuracies = np.zeros(10)+50
-    losses_array = np.zeros(num_epochs)
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        
-        anneal_factor = 1# Sigmoid(epoch, num_epochs)
-        #print(f"Epoch {epoch+1}, KL Annealing Factor: {anneal_factor}")
-        
-        #Iterates through entire dataset, doing a SVI step after each batch to improve efficiency
-        neural_network.train()
-        for batch_index, (current_train_data, current_train_class) in enumerate(train_dataloader):
-            loss = svi.step(current_train_data, current_train_class, anneal_factor=anneal_factor)
-            epoch_loss += loss
-            
-            #if batch_index % 10 == 0:
-            #    print(f"Epoch: {epoch+1}; Batch: {batch_index}, Loss: {epoch_loss:.4f}")
-        
-        #Output average loss value over the whole epoch
-        average_loss = epoch_loss/len(train_dataloader)
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch+1} completed! Average loss: {average_loss:.4f}") 
-            #print("Average log_std for 1st layer weights: ", np.mean(pyro.get_param_store()['L1WLogStd'].detach().cpu().numpy()))    
-            #print("Average log_std for 2nd layer weights: ", np.mean(pyro.get_param_store()['L2WLogStd'].detach().cpu().numpy()))
-        losses_array[epoch] = average_loss
-        
-        #Start the validation to test model accuracy after an epoch of training
-        neural_network.eval()
-        current_val_data, current_val_class = next(iter(val_dataloader))
-        correct_number = np.zeros(current_val_class.shape[0])
-        
-        #Number of times to sample the predictions for each data point - higher number = less spread, but more computation time!
-        sample_number = 200
-        for sample in range(sample_number):
-            ##Need to sample values for uncertain features from their uncertainties and return a reduced dataset if using this method
-            if sampled_uncertainties:
-                temp_val_data = UncertainValueSampling(current_val_data)
-            else:
-                temp_val_data = current_val_data
-            
-            #Sample the posterior weights and run the neural network on these
-            guide_trace = pyro.poutine.trace(guide).get_trace(None, None)
-            network_replay = pyro.poutine.replay(neural_network, trace=guide_trace)
-            
-            #Generates predictions from the network - no gradient tracking needed
-            with torch.no_grad():
-                logits = network_replay(temp_val_data)
-                probs = nn.functional.softmax(logits, dim=-1)
-                predictions = torch.argmax(probs, dim=-1)
-                #if epoch == 9:
-                #    print(probs, predictions)
-    
-            correct_number += (predictions.cpu().numpy() == current_val_class.cpu().numpy())
-        
-        accuracy_rate = (correct_number/sample_number)*100
-        average_accuracy = np.mean(accuracy_rate)
-        last_10_accuracies[epoch%10] = average_accuracy
-        #print(f"Average accuracy after Epoch {epoch+1}: {average_accuracy:.2f}%")
-        if epoch % 10 == 0:
-            print(f"Rolling average accuracy (last 10 epochs): {np.mean(last_10_accuracies):.2f}%")
-
-    return losses_array
-'''
-def MCMCMethod(train_data, train_classes, num_samples):
-    '''
-    Runs the MCMC method on the provided training data and labels
+    Runs the MCMC method on the provided training data and labels, using the provided model function
     Inputs:
         Tensor containing the training data
         Tensor containing the training labels
         Int for the number of samples to draw for the MCMC run - with warmup included, twice as many samples are produced
+        Function for the correct model to be using (i.e: classification or redshift prediction)
     Returns:
         MCMC method object
     '''
-    nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False)
+    target_accept_prob = 0.8 #Default is 0.8; increasing it decreases step size within NUTS, making sampling more stable (or "robust", according to Pyro documentation)
+    print("Using a target acceptance probability of", target_accept_prob)
+    nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False, target_accept_prob=target_accept_prob)
+        
     mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples)#, warmup_steps=min(num_samples, 100))
-    mcmc.run(train_data, train_classes)
+    mcmc.run(train_data, train_labels)
         
     return mcmc
 
-def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, return_metrics, run_number=200):
+def ClassMCMCAccuracy(test_data, test_classes, samples_no_unc, return_metrics, run_number=10):
     '''
     Determines the accuracy of the model trained using MCMC by comparing model predictions on the test data to the true labels
     Inputs:
         MCMC method object - irrelevant if samples are passed into function
         Tensor containing the test data
         Tensor containing the test labels
-        *Optional* Dictionary containing the MCMC samples if already obtained, or None if samples not passed into MCMCPlotting function
+        *Optional* Dictionary containing the MCMC samples if already obtained, or None if samples not passed into ClassMCMCPlotting function
         *Optional* Int specifying the number of times to apply the samples to the provided test data
     Returns:
         Array containing the predicted labels for each object by each sample
         Array containing the raw class probabilities for each object by each sample
     '''
     test_classes = test_classes.cpu().numpy()
-    
+    '''
     #Only want posterior samples for the network weights and biases - input variables should be resampled!
     if samples_no_unc == None:
         samples = mcmc.get_samples()
@@ -805,16 +716,16 @@ def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, return_metrics, 
         network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
         for x in network_keys:
             samples_no_unc[x] = samples[x]
-        
+     '''   
     accuracy_rates = np.zeros(run_number)
     f1_scores = np.zeros(run_number)
     brier_scores = np.zeros(run_number)
     auc_scores=np.zeros(run_number)
 
     for i in range(run_number):        
-        predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=samples_no_unc, return_sites={"obs", "probabilities"})
+        predictive = pyro.infer.Predictive(model=ClassificationModelFunc, posterior_samples=samples_no_unc, return_sites={"obs_class", "probabilities"})
         output = predictive(test_data)
-        preds, probs = output['obs'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
+        preds, probs = output['obs_class'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
         
         correct_number=0
         f1_score_total=0
@@ -851,7 +762,7 @@ def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, return_metrics, 
         
     #print(avg_preds, test_classes, np.sum(avg_preds==test_classes))
     
-    print("Mean accuracy rate for sample set:", np.mean(accuracy_rates))
+    print("Mean accuracy rate for sample set:", np.mean(accuracy_rates), "%")
     print("Mean F1 score for sample set:", np.mean(f1_scores))
     print("Mean Brier score for sample set:", np.mean(brier_scores))
     print("Mean AUC score for sample set:", np.mean(auc_total))
@@ -861,19 +772,19 @@ def MCMCAccuracy(mcmc, test_data, test_classes, samples_no_unc, return_metrics, 
     else:
         return preds, probs
 
-def MCMCPlotting(mcmc, test_data, test_classes, samples=None, plots=True, return_metrics=False):
+def ClassMCMCPlotting(mcmc, test_data, test_classes, samples=None, plots=True, return_metrics=False):
     '''
     Produces some plots using the MCMC data (e.g: predicted labels histogram, trace plots of Layer 2 weights, entropy of predictions)
     Inputs:
         MCMC method object
         Tensor containing the test data
         Tensor containing the test labels
-        *Optional* Dictionary containing the MCMC samples if already obtained - just used to pass through to the MCMCAccuracy function (defaults to None if samples not provided)
+        *Optional* Dictionary containing the MCMC samples if already obtained - just used to pass through to the ClassMCMCAccuracy function (defaults to None if samples not provided)
     '''    
     if return_metrics:
-        preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = MCMCAccuracy(mcmc, test_data, test_classes, samples, return_metrics)
+        preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = ClassMCMCAccuracy(test_data, test_classes, samples, return_metrics)
     else:
-        preds, probs = MCMCAccuracy(mcmc, test_data, test_classes, samples, return_metrics)
+        preds, probs = ClassMCMCAccuracy(test_data, test_classes, samples, return_metrics)
         
     fsrqs = np.where(test_classes.cpu().numpy() == 1)
     blls = np.where(test_classes.cpu().numpy() == 0)
@@ -932,15 +843,16 @@ def MCMCPlotting(mcmc, test_data, test_classes, samples=None, plots=True, return
         
     if return_metrics:
         return accuracy_rates, f1_scores, brier_scores, auc_scores
-    '''
-if cross_validation_k > 1:
+'''
+#Temporary code for calculating metrics for separate folds
+if cross_validation_k_class > 1:
     #CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
-    #skf = sklearn.model_selection.StratifiedKFold(cross_validation_k) #Stratified K-fold CV keeps class compositions equal between fold splits
+    #skf = sklearn.model_selection.StratifiedKFold(cross_validation_k_class) #Stratified K-fold CV keeps class compositions equal between fold splits
     
-    master_accuracies = np.zeros(cross_validation_k)
-    master_f1s = np.zeros(cross_validation_k)
-    master_briers = np.zeros(cross_validation_k)
-    master_aucs = np.zeros(cross_validation_k)
+    master_accuracies = np.zeros(cross_validation_k_class)
+    master_f1s = np.zeros(cross_validation_k_class)
+    master_briers = np.zeros(cross_validation_k_class)
+    master_aucs = np.zeros(cross_validation_k_class)
     for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, train_class_tensor)):
         print(f"Fold {fold+1}")
         temp_val_data = train_data_tensor[test_data]
@@ -949,9 +861,9 @@ if cross_validation_k > 1:
         temp_train_data = train_data_tensor[train_data]
         temp_train_classes = train_class_tensor[train_data]
             
-        #mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
-        #list_mcmcs.append(mcmc)
-        accuracies, f1_scores, brier_scores, auc_scores = MCMCPlotting(list_mcmcs[fold], temp_val_data, temp_val_classes, return_metrics=True, plots=False)
+        #mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples, ClassificationModelFunc)
+        #list_mcmcs_class.append(mcmc)
+        accuracies, f1_scores, brier_scores, auc_scores = ClassMCMCPlotting(list_mcmcs_class[fold], temp_val_data, temp_val_classes, return_metrics=True, plots=False)
         master_accuracies[fold] = np.mean(accuracies)
         master_f1s[fold] = np.mean(f1_scores)
         master_briers[fold] = np.mean(brier_scores)
@@ -965,11 +877,15 @@ if cross_validation_k > 1:
     print("Average Brier score over all folds: ", np.mean(master_briers))
     print("Average AUC from each fold: ", master_aucs)
     print("Average AUC over all folds: ", np.mean(master_aucs))
-
-    '''
+'''
+    
 def DictSplit(samples_dict, cross_validation_k_number=5):
     '''
     Splits a full sample dictionary into k separate dictionaries
+    Inputs: 
+        Dictionary containing all samples (and keys)
+    Returns: 
+        List of dictionaries containing the samples for the network weights and biases
     '''
     split_sample_dictionaries = []
     for j in range(cross_validation_k_number):
@@ -987,28 +903,126 @@ def DictSplit(samples_dict, cross_validation_k_number=5):
             
     return split_sample_dictionaries
 
-def SaveSamples(sample_dictionary, file_name='temp_samples_dict'):
+def SaveSamples(sample_dictionary, file_name='temp_samples_dict.npy'):
     print(f"Saving samples to file {file_name}")
-    np.save(f'{file_name}.npy', all_samples)
+    np.save(f'{file_name}', sample_dictionary)
     
 def LoadSamples(file_name):
     print(f"Loading samples from file {file_name}")
     return np.load(f'{file_name}', allow_pickle=True).item()
+
+def RetrieveBCUs(input_master_array):
+    class_feature = "CLASS"
+    filtered_array = input_master_array
         
+    for i in range(len(filtered_array)):
+        class_temp = filtered_array[class_feature][i]
+        class_temp = class_temp.lower()
+        
+        if (class_temp != 'bcu'):
+            class_temp = 'inval'
+            
+        filtered_array[class_feature][i] = class_temp
+    
+    filtered_array = filtered_array[filtered_array[class_feature] == 'bcu']
+    return filtered_array
+
+def ClassifyingBCUs(input_master_array, sample_set=None, zscore_means=zscore_means, zscore_stds=zscore_stds, plots=True):
+    print(np.unique(input_master_array["CLASS"]))
+    master_bcu_array = RetrieveBCUs(input_master_array)
+    #print(np.unique(master_bcu_array["CLASS"]))
+    
+    bcu_data_array = np.zeros((len(master_bcu_array), len(features_master_list)-3), dtype=np.float32)
+    bcu_class_array = np.array(len(master_bcu_array), dtype=str)
+    bcu_redshift_array_temp = np.array(len(master_bcu_array), dtype=np.float32)
+    bcu_source_name_array = np.array(len(master_bcu_array), dtype=str)
+    
+    for i in range(len(features_master_list)):
+        feature = master_headers_array[features_master_list[i]]
+        
+        if i==23: #Splits off the classification array
+            bcu_class_array = master_bcu_array[feature]
+            
+            #Convert class strings to numerical values - easier to compare predictions to actual values!
+            bcu_class_array[bcu_class_array == 'bcu'] = 2
+            bcu_class_array = np.asarray(bcu_class_array, dtype=int)
+            
+        elif i==24: #Splits off the redshift array - also have to swap the byte order from 'big-endian' to 'little-endian'
+            bcu_redshift_array_temp = master_bcu_array[feature]
+            bcu_redshift_array = bcu_redshift_array_temp.byteswap().view(bcu_redshift_array_temp.dtype.newbyteorder('='))
+
+            
+        elif i==25: #Splits off the Source_Name array
+            bcu_source_name_array = master_bcu_array[feature]
+            
+        else:
+            bcu_data_array[:, i] = master_bcu_array[feature]
+            
+    bcu_data_array, zscore_means, zscore_stds = DataTransformation(bcu_data_array, transformations, zscore_means=zscore_means, zscore_stds=zscore_stds)
+    bcu_data_tensor = torch.tensor(bcu_data_array)
+    
+    #print(bcu_data_tensor.shape)
+    
+    if sample_set == None:
+        samples_file_name = 'temp_samples_dict.npy'
+        sample_set = LoadSamples(samples_file_name)
+    
+    predictive = pyro.infer.Predictive(model=ClassificationModelFunc, posterior_samples=sample_set, return_sites={"obs_class", "probabilities"})
+    output = predictive(bcu_data_tensor)
+    preds, probs = output['obs_class'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
+    
+    avg_probs = np.mean(probs, axis=0)
+    mean_pred = np.argmax(avg_probs, axis=1)
+    
+    if plots==True:
+        plt.hist(np.squeeze(avg_probs[:, 1]), label='FSRQ Probability bins', bins=20, color='red')
+        plt.plot([0.5, 0.5], [0, 75], color='black', label='50% probability threshold')
+        plt.title("Histogram of the FSRQ probabilities of classified BCUs")
+        plt.ylabel("Number of objects")
+        plt.xlabel("FSRQ Probability")
+        plt.legend(loc='upper right')
+        plt.show()
+        
+        plt.scatter(np.mean(probs[:, :, 1], axis=0), np.std(probs[:, :, 1], axis=0), color='red', marker='x', alpha=0.8)
+        plt.title("Uncertainty (standard deviation) in FSRQ probability against mean FSRQ probability per BCU object")
+        plt.xlabel("Mean FSRQ probability")
+        plt.ylabel("Uncertainty in FSRQ probability")
+        plt.show()
+        
+    #print(np.unique(mean_pred, return_counts=True))
+    return bcu_data_tensor, probs, bcu_redshift_array, bcu_source_name_array
+
+def ListMergingAndTrimmingMCMCs(mcmc_list):
+    #Trim out unnecessary columns and combine the MCMC samples from each fold into one large dictionary    
+    all_samples = {}
+    network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
+    for x in network_keys:
+        for j in range(len(mcmc_list)):
+            mcmc = mcmc_list[j]
+            if j == 0:
+                temp = mcmc.get_samples()[x]
+            else:
+                temp = torch.cat((temp, mcmc.get_samples()[x]), dim=0)
+            
+        all_samples[x] = temp
+        
+    return all_samples
+    
+
 #losses_array = SVIMethod()
 
-###CAN RUN THESE BEFORE ANY MCMC STUFF TO INVESTIGATE INITIAL PREDICTIVE BEHAVIOUR OF NETWORK###
+###CAN RUN THESE BEFORE ANY MCMC STUFF TO INVESTIGATE INITIAL PREDICTIVE BEHAVIOUR OF CLASSIFICATION NETWORK###
 ###ADD A RETURN TO THE PYRO.DETERMINISTIC OF THE PROBABILITIES BEFORE RUNNING THESE, SO PROBS ARE RETURNED###
-#test = ModelFunc(train_data_tensor)
+#test = ClassificationModelFunc(train_data_tensor)
 #plt.hist(test.detach().numpy())
 
-list_mcmcs = []
+list_mcmcs_class = []
 num_samples = 500 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples done in total
-cross_validation_k = 5 #Number of folds to make, number of cross-validation runs to perform. Setting it to 1 just trains one model on the whole training set, and applies it to the test set
+cross_validation_k_class = 1 #Number of folds to make, number of cross-validation runs to perform. Setting it to 1 just trains one model on the whole training set, and applies it to the test set
 
-if cross_validation_k > 1:
+if cross_validation_k_class > 1:
     #CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
-    skf = sklearn.model_selection.StratifiedKFold(cross_validation_k) #Stratified K-fold CV keeps class compositions equal between fold splits
+    skf = sklearn.model_selection.StratifiedKFold(cross_validation_k_class) #Stratified K-fold CV keeps class compositions equal between fold splits
     
     for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, train_class_tensor)):
         print(f"Fold {fold+1}")
@@ -1018,122 +1032,117 @@ if cross_validation_k > 1:
         temp_train_data = train_data_tensor[train_data]
         temp_train_classes = train_class_tensor[train_data]
             
-        mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples)
-        list_mcmcs.append(mcmc)
-        accuracies, f1_scores, brier_scores, auc_scores = MCMCPlotting(list_mcmcs[fold], temp_val_data, temp_val_classes, return_metrics=True)
+        mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples, ClassificationModelFunc)
+        list_mcmcs_class.append(mcmc)
+        ClassMCMCPlotting(list_mcmcs_class[fold], temp_val_data, temp_val_classes, return_metrics=False)
 
 else:
-    mcmc = MCMCMethod(train_data_tensor, train_class_tensor, num_samples)
-    list_mcmcs.append(mcmc)
+    #Training a single model on all data at once gives the 'most optimal' sample set
+    mcmc = MCMCMethod(train_data_tensor, train_class_tensor, num_samples, ClassificationModelFunc)
+    list_mcmcs_class.append(mcmc)
+
+
+all_samples_class = ListMergingAndTrimmingMCMCs(list_mcmcs_class)
+#all_samples_class = LoadSamples('temp_samples_class_dict.npy')
+
+#Training data reduction
+overflow_preds, train_class_mean_probs = ClassMCMCAccuracy(train_data_tensor, train_class_tensor, all_samples_class, return_metrics=False, run_number=1)
+train_class_mean_probs_tensor = torch.tensor(np.mean(train_class_mean_probs[:, :, 1], axis=0))
+redshift_train_data_tensor = torch.cat((train_data_tensor, train_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_redshift_indices = np.where(train_redshift_array != -np.inf)
+redshift_train_data_tensor = redshift_train_data_tensor[known_redshift_indices, :]
+train_redshift_tensor = torch.tensor(train_redshift_array[known_redshift_indices])
+
+
+#Testing data reduction
+overflow_preds_test, test_class_mean_probs = ClassMCMCAccuracy(test_data_tensor, test_class_tensor, all_samples_class, return_metrics=False, run_number=1)
+test_class_mean_probs_tensor = torch.tensor(np.mean(test_class_mean_probs[:, :, 1], axis=0))
+redshift_test_data_tensor = torch.cat((test_data_tensor, test_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_redshift_indices_test = np.where(test_redshift_array != -np.inf)
+redshift_test_data_tensor = redshift_test_data_tensor[known_redshift_indices_test, :]
+test_redshift_tensor = torch.tensor(test_redshift_array[known_redshift_indices_test])
+
+
+#BCU data reduction
+bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class, plots=False)
+bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
+bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+
+known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
+known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
+known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
+#known_bcu_data_tensor = torch.squeeze(known_bcu_data_tensor)
+#print(known_bcu_data_tensor.shape)
+#print(known_bcu_class_mean_probs)
+
+def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples, plots=False):
+    predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, posterior_samples=samples, return_sites={"obs_redshift", "sigma"})
+    output = predictive(input_data_tensor)
+    redshift_preds = output['obs_redshift'].cpu().numpy().squeeze()
+    #plt.hist(output['sigma'])
     
-    accuracy_rates, f1_scores, brier_scores, auc_scores = MCMCPlotting(list_mcmcs[0], test_data_tensor, test_class_tensor, return_metrics=True)
-    master_accuracies_mean, master_accuracies_std = np.mean(accuracy_rates), np.std(accuracy_rates)
-    master_f1_mean, master_f1_std = np.mean(f1_scores), np.std(f1_scores)
-    master_brier_mean, master_brier_std = np.mean(brier_scores), np.std(brier_scores)
-    master_auc_mean, master_auc_std = np.mean(auc_scores), np.std(auc_scores)
-
-
-#Combine the samples from each fold into one large dictionary    
-all_samples = {}
-network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
-for x in network_keys:
-    for j in range(len(list_mcmcs)):
-        mcmc = list_mcmcs[j]
-        if j == 0:
-            temp = mcmc.get_samples()[x]
-        else:
-            temp = torch.cat((temp, mcmc.get_samples()[x]), dim=0)
+    avg_redshift_preds = np.mean(redshift_preds, axis=0)
+    std_redshift_preds = np.std(redshift_preds, axis=0)
+    
+    redshifts_good_fit_indices = np.where(std_redshift_preds < 2.5)
+    avg_redshift_preds = avg_redshift_preds[redshifts_good_fit_indices]
+    std_redshift_preds = std_redshift_preds[redshifts_good_fit_indices]
+    input_redshift_tensor = input_redshift_tensor[redshifts_good_fit_indices]
+    
+    input_redshift_array = input_redshift_tensor.cpu().numpy()
+    RMSE = np.sqrt(np.sum(((avg_redshift_preds - input_redshift_array)**2)/input_redshift_array)/len(input_redshift_array))
+    print("RMSE:", RMSE)
         
-    all_samples[x] = temp
+    if plots:
+        index_to_plot = 6
+        plt.hist(redshift_preds[:, index_to_plot], bins=20)
+        plt.title(f"Histogram of predictions over all samples for object, index {index_to_plot}, in dataset")
+        plt.show()
+        plt.hist(avg_redshift_preds, density=True, alpha=0.6, label="Predicted", bins=20)
+        plt.hist(input_redshift_tensor, density=True, alpha=0.6, label="Actual", bins=20)
+        plt.legend()
+        plt.title(f"Histogram of the predicted values and actual values of redshift for the dataset of {input_redshift_tensor.shape[0]} sources")
+        plt.show()
+        plt.errorbar(input_redshift_tensor, avg_redshift_preds, yerr=std_redshift_preds, fmt='x')#, marker='x')
+        plt.plot([0, 3], [0, 3], ls='--', color='black', label='Perfect prediction accuracy')
+        plt.xlabel("Actual redshift values")
+        plt.ylabel("Predicted redshift values")
+        plt.title(f"Scatter plot of predicted values against actual values of redshift for the dataset of {input_redshift_tensor.shape[0]} sources")
+        plt.legend()
+        plt.show()
+
+list_mcmcs_redshift = []
+#Only attempts to run the redshift predictions when the full dataset has been used in training for classifications        
+if cross_validation_k_class == 1:
+    mcmc = MCMCMethod(redshift_train_data_tensor, train_redshift_tensor, num_samples, RedshiftsModelFunc)
+    list_mcmcs_redshift.append(mcmc)
     
-#plt.plot(np.linspace(0, len(losses_array)-1, len(losses_array)), losses_array)
+    all_samples_redshift = ListMergingAndTrimmingMCMCs(list_mcmcs_redshift)
+    #all_samples_redshift = LoadSamples('temp_samples_redshift_dict.npy')
+    
+    #Training data predictions
+    RedshiftPlotting(redshift_train_data_tensor, train_redshift_tensor, all_samples_redshift, plots=True)
+    
+    #Test data predictions
+    RedshiftPlotting(redshift_test_data_tensor, test_redshift_tensor, all_samples_redshift, plots=True)
+    
+    #BCU Predictions
+    RedshiftPlotting(known_bcu_data_tensor, known_bcu_redshifts_tensor, all_samples_redshift, plots=True)
+
+    
 finish = time.time()
 print("Run time:", finish-start, "seconds")
 print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
 
-def ClassifyingBCUs():
-    def RetrieveBCUs(input_master_array):
-        class_feature = "CLASS"
-        filtered_array = input_master_array
-        
-        #print(filtered_array["CLASS"][0:50])
-        
-        for i in range(len(filtered_array)):
-            class_temp = filtered_array[class_feature][i]
-            class_temp = class_temp.lower()
-            
-            if (class_temp != 'bcu'):
-                class_temp = 'inval'
-                
-            filtered_array[class_feature][i] = class_temp
-            
-        filtered_array = filtered_array[filtered_array[class_feature] != 'inval']
-        
-        return filtered_array
-    
-    pls_work_pls = RetrieveBCUs(master_data_array)
-    print(pls_work_pls.shape)
-    
-    bcu_data_array = np.zeros((len(pls_work_pls), len(features_master_list)-1), dtype=np.float32)
-    bcu_class_array = np.array(len(pls_work_pls), dtype=str)
-    
-    for i in range(len(features_master_list)):
-        feature = master_headers_array[features_master_list[i]]
-        
-        if i==23: #Splits off the classification array
-            bcu_class_array = pls_work_pls[feature]
-            
-            #Convert class strings to numerical values - easier to compare predictions to actual values!
-            bcu_class_array[bcu_class_array == 'bcu'] = 2
-            bcu_class_array = np.asarray(bcu_class_array, dtype=int)
-            
-        else:
-            bcu_data_array[:, i] = pls_work_pls[feature]
-            
-    bcu_data_array, zscore_means, zscore_stds = DataTransformation(bcu_data_array, transformations, zscore_means=zscore_means, zscore_stds=zscore_stds)
-            
-    bcu_data_tensor = torch.tensor(bcu_data_array)
-    print(bcu_data_tensor.shape)
-    
-    mcmc = list_mcmcs[0]
-    run_number = 5
-    samples = mcmc.get_samples()
-    samples_no_unc = {}
-    network_keys = ['Layer1.weight', 'Layer1.bias', 'Layer2.weight', 'Layer2.bias']
-    for x in network_keys:
-        samples_no_unc[x] = samples[x]
-    
-    predictive = pyro.infer.Predictive(model=ModelFunc, posterior_samples=LoadSamples('final_model_32_nodes.npy'), return_sites={"obs", "probabilities"})
-    output = predictive(bcu_data_tensor)
-    preds, probs = output['obs'].cpu().numpy(), output['probabilities'].squeeze().cpu().numpy()
-    
-    avg_probs = np.mean(probs, axis=0)
-    mean_pred = np.argmax(avg_probs, axis=1)
-    
-    plt.hist(np.squeeze(avg_probs[:, 1]), label='FSRQ Probability bins', bins=20, color='red')
-    plt.plot([0.5, 0.5], [0, 75], color='black', label='50% probability threshold')
-    plt.title("Histogram of the FSRQ probabilities of classified BCUs")
-    plt.ylabel("Number of objects")
-    plt.xlabel("FSRQ Probability")
-    plt.legend(loc='upper right')
-    plt.show()
-    
-    plt.scatter(np.mean(probs[:, :, 1], axis=0), np.std(probs[:, :, 1], axis=0), color='red', marker='x', alpha=0.8)
-    plt.title("Uncertainty (standard deviation) in FSRQ probability against mean FSRQ probability per BCU object")
-    plt.xlabel("Mean FSRQ probability")
-    plt.ylabel("Uncertainty in FSRQ probability")
-    plt.show()
-    
-    print(np.unique(mean_pred, return_counts=True))
+#SaveSamples(all_samples_class, file_name='temp_samples_class_dict.npy')
+#SaveSamples(all_samples_redshift, file_name='temp_samples_redshift_dict.npy')
 
-#ClassifyingBCUs()
-
-#SaveSamples(all_samples, file_name='temp_samples_dict.npy')
 #loaded_samples = LoadSamples('temp_samples_dict.npy')
 
 #time.sleep(10)
 #os.system("shutdown.exe /h")
-
 
 '''
 #Bespoke code to run through previously-generated sample files during node testing and calculate diagnostic metrics
@@ -1149,16 +1158,15 @@ for x in range(len(nodes_to_test)):
     temp_node_num = nodes_to_test[x]
     print(f"\n {temp_node_num} hidden nodes")
     
-    temp_neural_network = ClassificationNeuralNetwork(input_nodes, temp_node_num, output_nodes)
+    temp_neural_network = BayesianNeuralNetwork(input_nodes_classification, temp_node_num, output_nodes_classification)
     
-    def ModelFunc(input_features, correct_labels=None, anneal_factor=1.0, sampled_uncertainties=sampled_uncertainties):
+    def ClassificationModelFunc(input_features, correct_labels=None, sampled_uncertainties=sampled_uncertainties):
         
         #Runs the model on the given input feature tensor, then sampling a classification from these logits
         #Optionally will use sampled values of uncertain features from a normal distribution with the std. being the feature's associated uncertainty
         #
         #Inputs: Tensor of the input features to be passed into the neural network
         #        *Optional* Tensor of the correct classifications
-        #        *Optional* Annealing factor - passed through from the guide, not used here
         #        Boolean for whether to obtain samples from a normal distribution for features with uncertainties
                 
         #Returns: Tensor of the actual correct labels itself (if passed into the function)
@@ -1189,17 +1197,15 @@ for x in range(len(nodes_to_test)):
         
         else:
             logits = temp_neural_network(input_features)
-            
-        #with pyro.poutine.scale(None, anneal_factor):
-            
+                        
         pyro.deterministic("probabilities", nn.functional.softmax(logits, dim=-1))
         
         with pyro.plate("results", logits.shape[0]):
-            pyro.sample("obs", dist.Categorical(logits=logits), obs=correct_labels)
+            pyro.sample("obs_class", dist.Categorical(logits=logits), obs=correct_labels)
             
     
     temp_samples = LoadSamples(f"individual_{temp_node_num}_nodes.npy")
-    preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = MCMCAccuracy(None, test_data_tensor, test_class_tensor, temp_samples, return_metrics=True, run_number=5)
+    preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = ClassMCMCAccuracy(test_data_tensor, test_class_tensor, temp_samples, return_metrics=True, run_number=5)
         
     master_accuracies[x] = np.mean(accuracy_rates)
     master_f1[x] = np.mean(f1_scores)
@@ -1238,19 +1244,19 @@ for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, trai
     temp_val_data = train_data_tensor[test_data]
     temp_val_classes = train_class_tensor[test_data]
     
-    preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = MCMCAccuracy(list_mcmcs[fold], temp_val_data, temp_val_classes, split_samples[fold], return_metrics=True, run_number=1)
+    preds, probs, accuracy_rates, f1_scores, brier_scores, auc_scores = ClassMCMCAccuracy(temp_val_data, temp_val_classes, split_samples[fold], return_metrics=True, run_number=1)
 
     fpr, tpr, thresholds = sklearn.metrics.roc_curve(temp_val_classes, np.mean(probs, axis=0)[:, 1])
     auc_total += sklearn.metrics.roc_auc_score(temp_val_classes, np.mean(probs, axis=0)[:, 1])
     
-    if fold != cross_validation_k - 1:
+    if fold != cross_validation_k_class - 1:
         plt.plot(fpr, tpr, color='purple', alpha=0.3)
         
 plt.plot(fpr, tpr, label='ROC Curve for model', color='purple', alpha=0.3)
 plt.plot([0, 1], [0, 1], ls='--', color='gray', alpha=0.7, label='Random guesses curve')
 plt.xlabel("False Positive Rate (FPR)")
 plt.ylabel("True Positive Rate (TPR)")
-plt.title(f"ROC curve for model; average AUC score = {auc_total/cross_validation_k:.3f}")
+plt.title(f"ROC curve for model; average AUC score = {auc_total/cross_validation_k_class:.3f}")
 plt.legend()    
 plt.show()
 '''
