@@ -24,6 +24,7 @@ from pyro.infer import SVI, Trace_ELBO, TraceGraph_ELBO
 import pyro.distributions as dist
 import sklearn.metrics
 import scipy
+import multiprocessing
 
 #Functionally, makes sure that Pytorch and Pyro have been imported and linked correctly
 assert issubclass(PyroModule[nn.Linear], nn.Linear)
@@ -373,7 +374,7 @@ else:
     input_nodes_redshifts = 24
     
 hidden_nodes_classification = 32
-hidden_nodes_redshifts = 32
+hidden_nodes_redshifts = 4
 
 output_nodes_classification = 2
 output_nodes_redshifts = 1
@@ -690,13 +691,13 @@ def MCMCMethod(train_data, train_labels, num_samples, ModelFunc, warmup_steps=No
     if warmup_steps==None: 
         warmup_steps = num_samples
         
-    target_accept_prob = 0.95 #Default is 0.8; increasing it decreases step size within NUTS, making sampling more stable (or "robust", according to Pyro documentation)
+    target_accept_prob = 0.9 #Default is 0.8; increasing it decreases step size within NUTS, making sampling more stable (or "robust", according to Pyro documentation)
     print("Using a target acceptance probability of", target_accept_prob)
     nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=False, target_accept_prob=target_accept_prob)
         
-    mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples, warmup_steps = warmup_steps)#, warmup_steps=min(num_samples, 100))
+    mcmc = pyro.infer.mcmc.MCMC(nuts_kernel, num_samples=num_samples, warmup_steps = warmup_steps, num_chains=3, mp_context="spawn")#, warmup_steps=min(num_samples, 100))
     mcmc.run(train_data, train_labels)
-        
+    
     return mcmc
 
 def ClassMCMCAccuracy(test_data, test_classes, samples_no_unc, return_metrics, run_number=10):
@@ -1106,7 +1107,7 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples, redshift
         array_temp = ax.hist(redshift_preds[:, index_to_plot], bins=50, density=True, alpha=0.8)
         lower_1_sigma = np.percentile(redshift_preds[:, index_to_plot], 16)
         higher_1_sigma = np.percentile(redshift_preds[:, index_to_plot], 84)
-        ax.plot([lower_1_sigma, lower_1_sigma], [0, max(array_temp[0])], color='red', ls='--')   
+        ax.plot([lower_1_sigma, lower_1_sigma], [0, max(array_temp[0])], color='red', ls='--')
         ax.plot([higher_1_sigma, higher_1_sigma], [0, max(array_temp[0])], color='red', ls='--', label='1$\sigma$ region')
         ax.plot([input_redshift_array[index_to_plot], input_redshift_array[index_to_plot]], [0, max(array_temp[0])], color='black', ls='--', label='True redshift of source')
         ax.set_xlabel("Predicted redshift")
@@ -1122,94 +1123,96 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples, redshift
 #test = ClassificationModelFunc(train_data_tensor)
 #plt.hist(test.detach().numpy())
 
-list_mcmcs_class = []
-num_samples_class = 1000 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples_class done in total
-cross_validation_k_class = 1 #Number of folds to make, number of cross-validation runs to perform. Setting it to 1 just trains one model on the whole training set, and applies it to the test set
-
-if cross_validation_k_class > 1:
-    #CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
-    skf = sklearn.model_selection.StratifiedKFold(cross_validation_k_class) #Stratified K-fold CV keeps class compositions equal between fold splits
+if __name__=="__main__":
+    list_mcmcs_class = []
+    num_samples_class = 1000 #Per cross_validation run, including warmup we have 2*cross_validation_k*num_samples_class done in total
+    cross_validation_k_class = 1 #Number of folds to make, number of cross-validation runs to perform. Setting it to 1 just trains one model on the whole training set, and applies it to the test set
     
-    for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, train_class_tensor)):
-        print(f"Fold {fold+1}")
-        temp_val_data = train_data_tensor[test_data]
-        temp_val_classes = train_class_tensor[test_data]
+    if cross_validation_k_class > 1:
+        #CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
+        skf = sklearn.model_selection.StratifiedKFold(cross_validation_k_class) #Stratified K-fold CV keeps class compositions equal between fold splits
         
-        temp_train_data = train_data_tensor[train_data]
-        temp_train_classes = train_class_tensor[train_data]
+        for fold, (train_data, test_data) in enumerate(skf.split(train_data_tensor, train_class_tensor)):
+            print(f"Fold {fold+1}")
+            temp_val_data = train_data_tensor[test_data]
+            temp_val_classes = train_class_tensor[test_data]
             
-        mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples_class, ClassificationModelFunc)
-        list_mcmcs_class.append(mcmc)
-        ClassMCMCPlotting(list_mcmcs_class[fold], temp_val_data, temp_val_classes, return_metrics=False)
-
-else:
-    #Training a single model on all data at once gives the 'most optimal' sample set
-    mcmc = MCMCMethod(train_data_tensor, train_class_tensor, num_samples_class, ClassificationModelFunc)
-    list_mcmcs_class.append(mcmc)
-
-
-all_samples_class = ListMergingAndTrimmingMCMCs(list_mcmcs_class, is_redshifts=False)
-#all_samples_class = LoadSamples('standardised_samples_class_dict.npy')
-
-
-### REDSHIFT TRAINING ###
-
-train_data_tensor_redshifts, train_redshifts_tensor = DataFormattingForRedshifts(train_data_tensor, train_class_tensor, train_redshift_array, all_samples_class)
-test_data_tensor_redshifts, test_redshifts_tensor = DataFormattingForRedshifts(test_data_tensor, test_class_tensor, test_redshift_array, all_samples_class)
-
-#BCU data reduction
-bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class, plots=False)
-bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
-bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
-
-known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
-known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
-known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
-
-#Log transform the redshifts - helps smooth out distribution of answers, (hopefully) improving higher-redshift accuracy!
-redshifts_log_transformed = True
-if redshifts_log_transformed:
-    train_redshifts_tensor = torch.log(1+train_redshifts_tensor)
-    test_redshifts_tensor = torch.log(1+test_redshifts_tensor)
-    known_bcu_redshifts_tensor = torch.log(1+known_bcu_redshifts_tensor)
-
-num_samples_redshift = 2000
-list_mcmcs_redshift = []
-
-#Only attempts to run the redshift predictions when the full dataset has been used in training for classifications
-if cross_validation_k_class == 1:
-    mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, RedshiftsModelFunc)#, warmup_steps=5000)
-    list_mcmcs_redshift.append(mcmc)
+            temp_train_data = train_data_tensor[train_data]
+            temp_train_classes = train_class_tensor[train_data]
+                
+            mcmc = MCMCMethod(temp_train_data, temp_train_classes, num_samples_class, ClassificationModelFunc)
+            list_mcmcs_class.append(mcmc)
+            ClassMCMCPlotting(list_mcmcs_class[fold], temp_val_data, temp_val_classes, return_metrics=False)
     
-    all_samples_redshift = ListMergingAndTrimmingMCMCs(list_mcmcs_redshift, is_redshifts=True)
-    #all_samples_redshift = LoadSamples('temp_samples_redshift_dict.npy')
+    #else:
+    #    #Training a single model on all data at once gives the 'most optimal' sample set
+    #    mcmc = MCMCMethod(train_data_tensor, train_class_tensor, num_samples_class, ClassificationModelFunc)
+    #    list_mcmcs_class.append(mcmc)
     
-    #Training data predictions
-    #RedshiftPlotting(train_data_tensor_redshifts, train_redshifts_tensor, all_samples_redshift, plots=True)
     
-    #Test data predictions
-    RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, all_samples_redshift, redshifts_log_transformed=redshifts_log_transformed, plots=True)
+    #all_samples_class = ListMergingAndTrimmingMCMCs(list_mcmcs_class, is_redshifts=False)
+    all_samples_class = LoadSamples('temp_samples_class_dict.npy')
     
-    #BCU Predictions
-    #RedshiftPlotting(known_bcu_data_tensor, known_bcu_redshifts_tensor, all_samples_redshift, plots=True)
-
-#Redshift MCMC diagnostics
-az.plot_trace(mcmc.get_samples()['Layer2.weight'].unsqueeze(0).cpu().numpy())
-print("Layer 2 weights ESS:", pyro.ops.stats.effective_sample_size(list_mcmcs_redshift[0].get_samples()['Layer2.weight'].unsqueeze(0)))
-print("Layer 2 weights split-Rhat:", pyro.ops.stats.split_gelman_rubin(list_mcmcs_redshift[0].get_samples()['Layer2.weight'].unsqueeze(0)))
-
-finish = time.time()
-print("Run time:", finish-start, "seconds")
-print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
-print(f"Used {hidden_nodes_classification} hidden nodes for classifier and a log prior width of {prior_scale_class}.\nUsed {hidden_nodes_redshifts} hidden nodes for redshift predictor and a log prior width of {prior_scale_redshift}, and an observation noise scale of {global_redshift_obs_noise_scale}.")
-
-#SaveSamples(all_samples_class, file_name='temp_samples_class_dict.npy')
-#SaveSamples(all_samples_redshift, file_name='temp_samples_redshift_dict.npy')
-
-#loaded_samples = LoadSamples('temp_samples_dict.npy')
-
-#time.sleep(10)
-#os.system("shutdown.exe /h")
+    
+    ### REDSHIFT TRAINING ###
+    
+    train_data_tensor_redshifts, train_redshifts_tensor = DataFormattingForRedshifts(train_data_tensor, train_class_tensor, train_redshift_array, all_samples_class)
+    test_data_tensor_redshifts, test_redshifts_tensor = DataFormattingForRedshifts(test_data_tensor, test_class_tensor, test_redshift_array, all_samples_class)
+    
+    #BCU data reduction
+    bcu_temp_data_tensor, bcu_class_mean_probs, bcu_redshift_array, bcu_source_name_array = ClassifyingBCUs(master_data_array, sample_set=all_samples_class)
+    bcu_class_mean_probs_tensor = torch.tensor(np.mean(bcu_class_mean_probs[:, :, 1], axis=0))
+    bcu_data_tensor = torch.cat((bcu_temp_data_tensor, bcu_class_mean_probs_tensor.unsqueeze(1)), dim=1)
+    
+    known_bcu_redshift_indices = np.where(bcu_redshift_array != -np.inf)
+    known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices, :], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
+    known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
+    
+    #Log transform the redshifts - helps smooth out distribution of answers, (hopefully) improving higher-redshift accuracy!
+    redshifts_log_transformed = True
+    if redshifts_log_transformed:
+        train_redshifts_tensor = torch.log(1+train_redshifts_tensor)
+        test_redshifts_tensor = torch.log(1+test_redshifts_tensor)
+        known_bcu_redshifts_tensor = torch.log(1+known_bcu_redshifts_tensor)
+    
+    num_samples_redshift = 15
+    list_mcmcs_redshift = []
+    
+    #Only attempts to run the redshift predictions when the full dataset has been used in training for classifications
+    if cross_validation_k_class == 1:
+        mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, RedshiftsModelFunc)#, warmup_steps=5000)
+        print(mcmc.get_samples())
+        list_mcmcs_redshift.append(mcmc)
+        
+        all_samples_redshift = ListMergingAndTrimmingMCMCs(list_mcmcs_redshift, is_redshifts=True)
+        #all_samples_redshift = LoadSamples('temp_samples_redshift_dict.npy')
+        
+        #Training data predictions
+        #RedshiftPlotting(train_data_tensor_redshifts, train_redshifts_tensor, all_samples_redshift, plots=True)
+        
+        #Test data predictions
+        RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, all_samples_redshift, redshifts_log_transformed=redshifts_log_transformed, plots=True)
+        
+        #BCU Predictions
+        #RedshiftPlotting(known_bcu_data_tensor, known_bcu_redshifts_tensor, all_samples_redshift, plots=True)
+    
+    #Redshift MCMC diagnostics
+    az.plot_trace(mcmc.get_samples()['Layer2.weight'].unsqueeze(0).cpu().numpy())
+    print("Layer 2 weights ESS:", pyro.ops.stats.effective_sample_size(list_mcmcs_redshift[0].get_samples()['Layer2.weight'].unsqueeze(0)))
+    print("Layer 2 weights split-Rhat:", pyro.ops.stats.split_gelman_rubin(list_mcmcs_redshift[0].get_samples()['Layer2.weight'].unsqueeze(0)))
+    
+    finish = time.time()
+    print("Run time:", finish-start, "seconds")
+    print("Used feature values sampled based on uncertainties: ", sampled_uncertainties)
+    print(f"Used {hidden_nodes_classification} hidden nodes for classifier and a log prior width of {prior_scale_class}.\nUsed {hidden_nodes_redshifts} hidden nodes for redshift predictor and a log prior width of {prior_scale_redshift}, and an observation noise scale of {global_redshift_obs_noise_scale}.")
+    
+    #SaveSamples(all_samples_class, file_name='temp_samples_class_dict.npy')
+    #SaveSamples(all_samples_redshift, file_name='temp_samples_redshift_dict.npy')
+    
+    #loaded_samples = LoadSamples('temp_samples_dict.npy')
+    
+    #time.sleep(10)
+    #os.system("shutdown.exe /h")
 
 '''
 #Bespoke code to run through previously-generated sample files during node testing and calculate diagnostic metrics
