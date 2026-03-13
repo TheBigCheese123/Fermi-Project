@@ -255,16 +255,23 @@ class FeatureDataset(Dataset):
 def InitialiseDataLoaders(feature_array, class_array, batch_size=64, shuffle=True):
     '''
     Package the input arrays into Pytorch Dataset and DataLoader objects
-    Inputs: 2D array for the network's input features
-            1D array for the actual source classifications
+    Inputs: 2D array OR 2D tensor for the network's input features
+            1D array OR 1D tensor for the actual source classifications
             *Optional* Integer for batch size to use for DataLoader
             *Optional* Boolean for whether the DataLoader should shuffle the input orders
     Outputs: Tensor for the input features
              Tensor for the actual classifications
              DataLoader object containing the input features and classifications
     '''
-    feature_tensor = torch.from_numpy(feature_array)
-    class_tensor = torch.from_numpy(class_array)
+    if type(feature_array) == torch.Tensor:
+        feature_tensor = feature_array
+    else:
+        feature_tensor = torch.from_numpy(feature_array)
+        
+    if type(class_array) == torch.Tensor:
+        class_tensor = class_array
+    else:
+        class_tensor = torch.from_numpy(class_array)
     
     dataset = FeatureDataset(feature_tensor, class_tensor)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
@@ -433,6 +440,7 @@ global_redshift_obs_noise_scale = -5 #Prior for observation noise modelled into 
 
 data_imputation = False #Declare whether to impute missing data to boost the size of the dataset, or whether to use 'clean data' only!
 
+including_classifications_in_training = False
 
 #####sns.heatmap(np.corrcoef(train_data_array, rowvar=False))#####
 
@@ -449,8 +457,13 @@ else:
 
 #Not including uncertainties as separate features
 #Either use them in sampling (sampled_uncertainties = True) or don't use them at all (sampled_uncertainties = False)
-input_nodes_classification = 17
-input_nodes_redshifts = 17 #Same inputs as classification plus the class probability
+if including_classifications_in_training:
+    input_nodes_classification = 17
+    input_nodes_redshifts = 18 #Same inputs as classifier plus the class probability
+else:
+    input_nodes_classification = 17
+    input_nodes_redshifts = 17 #Same inputs as classifier
+
 
 hidden_nodes_classification = 32
 hidden_nodes_redshifts = 4
@@ -459,10 +472,10 @@ output_nodes_classification = 2
 output_nodes_redshifts = 1
 
 if __name__=="__main__":
-    print("Using feature values sampled based on uncertainties: ", sampled_uncertainties)
+    print("Using feature values sampled based on uncertainties:", sampled_uncertainties)
     print(f"Using {hidden_nodes_classification} hidden nodes for classifier and a log prior width of {prior_scale_class}.\nUsing {hidden_nodes_redshifts} hidden nodes for redshift predictor and a log prior width of {prior_scale_redshift}, and an observation noise scale of {global_redshift_obs_noise_scale}.")
     print("Inferring an observation noise scale:", global_redshift_noise_sampling)
-    print("Imputing missing data columns: ", data_imputation)
+    print("Imputing missing data columns:", data_imputation)
 
 classification_neural_network = BayesianNeuralNetwork(input_nodes_classification, hidden_nodes_classification, output_nodes_classification, prior_scale_class)
 redshifts_neural_network = BayesianNeuralNetwork(input_nodes_redshifts, hidden_nodes_redshifts, output_nodes_redshifts, prior_scale_redshift)
@@ -527,8 +540,20 @@ def RedshiftsModelFunc(input_features, correct_redshifts=None, sampled_uncertain
     return predictions
 
 def UncertaintySampling(input_features, sampling_with_uncertainties, redshifts=False):
-    if redshifts:
-        non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]#, 23]
+    '''
+    Properly deals with the uncertainty sampling for the model
+    If sampling_with_uncertainties is True, we treat each of the uncertain features as a latent variable and sample a value from a normal dist. scaled by their associated catalog uncertainties
+        -> Must do it this way for HMC - random sampling of the input values collapses training to infinitesimal step sizes and 0 acceptance probability!
+    If sampling_with_uncertainties is False, we simply train on the fixed mean value for each uncertain feature
+    Inputs:
+        Tensor containing the input data
+        Boolean defining whether we want to sample uncertainties or not
+        *Optional* Boolean as to whether we are training with redshifts or not (defaults to False)
+    Returns:
+        Tensor with the uncertain input feature columns properly filled, and their associated uncertainty columns filtered out
+    '''
+    if redshifts and including_classifications_in_training:
+        non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22, 23]
     else:
         non_unc_inputs = [0, 1, 2, 7, 10, 15, 16, 17, 18, 19, 22]
         
@@ -710,11 +735,13 @@ hdu_table = fits_file[1]
 
 if data_imputation:
     master_headers_array, master_data_array = MissingDataImputation(hdu_table)
-    print("Imputed dataset size:", master_data_array.shape)
+    if __name__ == "__main__":
+        print("Imputed dataset size:", master_data_array.shape)
     
 else:
     master_headers_array, master_data_array = MissingDataFiltering(hdu_table)
-    print("Filtered dataset size:", master_data_array.shape)
+    if __name__ == "__main__":    
+        print("Filtered dataset size:", master_data_array.shape)
     
 #Format the string-based columns into network-readable numerical values
 master_data_array = PowerLawFormatting(master_data_array)
@@ -788,7 +815,7 @@ def BeforeAndAfterTransformationHistograms():
         
 #BeforeAndAfterTransformationHistograms()
 
-#Convert data arrays into Torch tensors and initialise DataLoaders 
+#Convert data arrays into Torch tensors and initialise DataLoaders for classification training
 train_data_tensor, train_class_tensor, train_dataloader = InitialiseDataLoaders(train_data_array, train_class_array, batch_size=32)
 #val_data_tensor, val_class_tensor, val_dataloader = InitialiseDataLoaders(val_data_array, val_class_array)
 test_data_tensor, test_class_tensor, test_dataloader = InitialiseDataLoaders(test_data_array, test_class_array)
@@ -808,7 +835,7 @@ def MCMCMethod(train_data, train_labels, num_samples, warmup_steps, ModelFunc, n
         MCMC method object
     '''
     target_accept_prob = 0.9 #Default is 0.8; increasing it decreases step size within NUTS, making sampling more stable (or "robust", according to Pyro documentation)
-    using_full_mass = True
+    using_full_mass = False
     print("Using a target acceptance probability of", target_accept_prob, "\nUsing full-mass matrix:", using_full_mass)
     
     nuts_kernel = pyro.infer.NUTS(ModelFunc, jit_compile=True, target_accept_prob=target_accept_prob, full_mass=using_full_mass)
@@ -1356,9 +1383,9 @@ def DataFormattingForRedshifts(input_data_tensor, input_class_tensor, input_reds
     
     return data_tensor_for_redshifts, known_redshifts_tensor, redshift_source_names_array
 
-def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples=None, guide=None, redshifts_z_scored=(), plots=False, return_metrics=False, prints=True):
+def RedshiftPerformance(input_data_tensor, input_redshift_tensor, samples=None, guide=None, redshifts_z_scored=(), plots=False, return_metrics=False, prints=True):
     '''
-    Takes in the input datasets and correct answers, and produces diagnostic information on the performance of the sample set used.
+    Produces diagnostic information on the performance of the sample set/guide when applied to the input dataset    
     Inputs:
         Tensor containing the input data for the model
         Tensor containing the correct redshift values
@@ -1381,7 +1408,7 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples=None, gui
     
     input_redshift_array = input_redshift_tensor.cpu().numpy()
     
-    redshift_outputs_tensor, redshift_preds_tensor, log_sigma_tensor = RedshiftPredictions(input_data_tensor, input_redshift_tensor, samples, guide)
+    redshift_outputs_tensor, redshift_preds_tensor, log_sigma_tensor = RedshiftPredictions(input_data_tensor, samples, guide)
     redshift_outputs = redshift_outputs_tensor.cpu().numpy().squeeze()
     redshift_preds = redshift_preds_tensor.cpu().numpy().squeeze()
 
@@ -1406,7 +1433,7 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples=None, gui
     
     input_redshift_tensor = input_redshift_tensor[redshifts_good_fit_indices]
     input_redshift_array = input_redshift_tensor.cpu().numpy()
-    print("Filtered all good!")    
+    
     RMSE = np.sqrt(np.sum(((avg_redshift_preds - input_redshift_array)**2)/input_redshift_array)/len(input_redshift_array))
     
     RMSE_true = np.sqrt(np.sum(((avg_redshift_preds - input_redshift_array)**2))/len(input_redshift_array))
@@ -1594,22 +1621,29 @@ def RedshiftPlotting(input_data_tensor, input_redshift_tensor, samples=None, gui
     if return_metrics:
         return redshift_preds, redshift_outputs, mean_lpd.item(), RMSE_true, r_squared, chi_squared_reduced
 
-def RedshiftPredictions(input_data_tensor, input_redshift_tensor, samples, guide):
+def RedshiftPredictions(input_data_tensor, samples, guide):
+    '''
+    Generates redshift predictions using the provided data tensor and either the sample set from HMC or the guide from SVI
+    Inputs:
+        Tensor containing the input data
+        Dict. containing the HMC samples (or None if SVI was used to train)
+        Guide object obtained from SVI training (or None if HMC was used to train)
+    '''
     #Creates correct predictive depending on if SVI or HMC was used, and if log_sigma was sampled or fixed
     noise_sampling = global_redshift_noise_sampling
     if guide == None:
         num_samples = samples['Layer2.bias'].shape[0]
         if noise_sampling:
-            predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, posterior_samples=samples, return_sites={"obs_redshift", "output_redshift", "log_sigma"})
+            predictive = pyro.infer.Predictive(model=HMC_Model, posterior_samples=samples, return_sites={"obs_redshift", "output_redshift", "log_sigma"})
         else:
-            predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, posterior_samples=samples, return_sites={"obs_redshift", "output_redshift"})
+            predictive = pyro.infer.Predictive(model=HMC_Model, posterior_samples=samples, return_sites={"obs_redshift", "output_redshift"})
         
     elif samples == None:
         num_samples = 500
         if noise_sampling:
-            predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, guide=guide, num_samples=num_samples, return_sites={"obs_redshift", "output_redshift", "log_sigma"})
+            predictive = pyro.infer.Predictive(model=SVI_Model, guide=guide, num_samples=num_samples, return_sites={"obs_redshift", "output_redshift", "log_sigma"})
         else:
-            predictive = pyro.infer.Predictive(model=RedshiftsModelFunc, guide=guide, num_samples=num_samples, return_sites={"obs_redshift", "output_redshift"})
+            predictive = pyro.infer.Predictive(model=SVI_Model, guide=guide, num_samples=num_samples, return_sites={"obs_redshift", "output_redshift"})
         
     else:
         sys.exit("DID NOT PASS IN A GUIDE OR SAMPLES TO THE REDSHIFT PREDICTIONS FUNCTION!")
@@ -1620,15 +1654,28 @@ def RedshiftPredictions(input_data_tensor, input_redshift_tensor, samples, guide
         print("Noise scale was not sampled during training!")
         output['log_sigma'] = (torch.zeros(num_samples)+global_redshift_obs_noise_scale).squeeze()
         
-        
     return output['output_redshift'], output['obs_redshift'], output['log_sigma']
 
 def FeatureImportanceTestRedshifts(input_data_tensor, input_answer_tensor, samples=None, guide=None, redshifts_z_scored=()):
-    including_classifications_in_training = False
-    non_uncertainty_features = [0, 1, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 17, 18, 19, 20, 22]#, 23]
-    
-    if 23 not in non_uncertainty_features and including_classifications_in_training:
-        print("WARNING: Classification not included in feature importance test!")
+    '''
+    Runs through each feature column in the input data in turn, and shuffles that specific feature
+    Then, predictions are re-run on the dataset with only that shuffled feature and diagnostics are logged
+    Plots the diagnostic metrics for each feature being shuffled
+    This tests the reliance of the model on each feature
+        -> Large changes in performance suggest that the model has learned the corresponding feature is of particular importance to predicting redshifts
+    Inputs:
+        Tensor containing the input data for the neural network
+        Tensor containing the correct redshift values
+        *Optional* Dict containing HMC samples
+        *Optional* Guide object obtained from SVI training
+        *Optional* Tuple containing the mean and std. to reverse redshift z-scoring
+    Returns:
+        Nothing!
+    '''
+    if including_classifications_in_training:
+        non_uncertainty_features = [0, 1, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 17, 18, 19, 20, 22, 23]
+    else:
+        non_uncertainty_features = [0, 1, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 17, 18, 19, 20, 22]
     
     #Index 0 will equate to the base model
     master_lpd = np.zeros(len(non_uncertainty_features)+1)
@@ -1640,7 +1687,7 @@ def FeatureImportanceTestRedshifts(input_data_tensor, input_answer_tensor, sampl
     master_feature_names = []
     master_feature_names.append("Base Model")
     
-    preds, outputs, master_lpd[0], master_RMSE[0], master_r_squared[0], master_chi_squared_reduced[0] = RedshiftPlotting(input_data_tensor, input_answer_tensor, samples=samples, guide=guide, redshifts_z_scored=redshifts_z_scored, plots=False, return_metrics=True, prints=False)
+    preds, outputs, master_lpd[0], master_RMSE[0], master_r_squared[0], master_chi_squared_reduced[0] = RedshiftPerformance(input_data_tensor, input_answer_tensor, samples=samples, guide=guide, redshifts_z_scored=redshifts_z_scored, plots=False, return_metrics=True, prints=False)
     master_avg_pred_std[0] = np.std(np.mean(preds, axis=0))
     
     count=0
@@ -1650,7 +1697,7 @@ def FeatureImportanceTestRedshifts(input_data_tensor, input_answer_tensor, sampl
         tensor_with_shuffled_feature = torch.clone(input_data_tensor)
         tensor_with_shuffled_feature[:, i] = tensor_with_shuffled_feature[torch.randperm(input_data_tensor.shape[0]), i]
         
-        preds, outputs, master_lpd[count], master_RMSE[count], master_r_squared[count], master_chi_squared_reduced[count] = RedshiftPlotting(tensor_with_shuffled_feature, input_answer_tensor, samples=samples, guide=guide, redshifts_z_scored=redshifts_z_scored, plots=False, return_metrics=True, prints=False)
+        preds, outputs, master_lpd[count], master_RMSE[count], master_r_squared[count], master_chi_squared_reduced[count] = RedshiftPerformance(tensor_with_shuffled_feature, input_answer_tensor, samples=samples, guide=guide, redshifts_z_scored=redshifts_z_scored, plots=False, return_metrics=True, prints=False)
         master_avg_pred_std[count] = np.std(np.mean(preds, axis=0))
         master_feature_names.append(master_headers_array[features_master_list[i]])
         '''
@@ -1690,6 +1737,37 @@ def FeatureImportanceTestRedshifts(input_data_tensor, input_answer_tensor, sampl
     ax5.set_xlabel("Shuffled Feature")
     fig.suptitle("Feature Importance Test Results")
     
+    
+def SVITrainingLoop(input_dataloader):
+    '''
+    Runs the SVI training loop across the dataloader for a predefined number of epochs
+    Inputs:
+        DataLoader object of the training dataset
+    Returns:
+        Learned guide object from training
+        List containing the loss values after each SVI step
+    '''
+    num_epochs=20000
+    pyro.clear_param_store()
+    guide = pyro.infer.autoguide.AutoDiagonalNormal(SVI_Model)
+    optimizer = pyro.optim.ClippedAdam({"lr": 1e-4, 'lrd': 0.01**(1/(num_epochs*len(input_dataloader)))})
+    svi = pyro.infer.SVI(SVI_Model, guide, optimizer, loss=pyro.infer.Trace_ELBO())
+    
+    for epoch in range(num_epochs):
+        for batch in enumerate(input_dataloader):
+            loss = svi.step(batch[1][0], batch[1][1])
+            loss_normalisation_constant = batch[1][0].numel()
+            loss=loss/loss_normalisation_constant #Normalise the loss value by the number of elements in the training batch, gives a rough idea of convergence
+            losses.append(loss)
+        
+        if epoch % (num_epochs/5) == 0:
+            print(f"Epoch {epoch}:, Loss: {loss}")
+            
+    plt.scatter(np.linspace(1, len(losses), len(losses)), np.log(np.array(losses)), marker='x')
+    plt.title("Loss graph for SVI")
+    plt.show()
+    
+    return guide, losses
 
 '''
 redshifts_without_class_samples_chain_split = {}
@@ -1830,9 +1908,6 @@ if __name__=="__main__":
     if using_SVI and using_HMC:
         sys.exit("Don't try and use both SVI and HMC at the same time!")
     
-    including_classifications_in_training = False
-    redshifts_z_scored = True
-
     train_data_tensor_redshifts, train_redshifts_tensor, train_source_name_redshifts = DataFormattingForRedshifts(train_data_tensor, train_class_tensor, train_redshift_array, train_source_name_array, all_samples_class, include_classifications=including_classifications_in_training)
     test_data_tensor_redshifts, test_redshifts_tensor, test_source_name_redshifts = DataFormattingForRedshifts(test_data_tensor, test_class_tensor, test_redshift_array, test_source_name_array, all_samples_class, include_classifications=including_classifications_in_training)
     
@@ -1845,6 +1920,7 @@ if __name__=="__main__":
     known_bcu_data_tensor, known_bcu_class_mean_probs, known_bcu_redshifts, known_bcu_source_name_array = bcu_data_tensor[known_bcu_redshift_indices], bcu_class_mean_probs_tensor[known_bcu_redshift_indices], bcu_redshift_array[known_bcu_redshift_indices], bcu_source_name_array[known_bcu_redshift_indices]
     known_bcu_redshifts_tensor = torch.tensor(known_bcu_redshifts)
     
+    redshifts_z_scored = True
     #Z-score the redshifts to standardise scale - may improve training stability!
     if redshifts_z_scored:
         redshifts_mean, redshifts_std = torch.mean(train_redshifts_tensor), torch.std(train_redshifts_tensor)
@@ -1917,22 +1993,23 @@ if __name__=="__main__":
     
     if using_SVI:
         #####SVI METHOD FOR REDSHIFTS#####
-        num_steps = 100000
         losses = []
         cross_validation_k_redshifts = 1
         
         if sampled_uncertainties:
-            SVI_model = pyro.poutine.block(RedshiftsModelFunc, hide=["Flux1000", "Energy_Flux100", "PL_Index", "LP_Index", "LP_beta", "Frac_Variability"])
+            #Using poutine.block prevents SVI from attempting to infer "true" values for each object's feature
+            #Since we apply to test data (where we don't know the "true" values anyway), it prevents unnecessary computation and avoid potential biases in the model - effectively we just treat the inputs as noisy!
+            SVI_Model = pyro.poutine.block(RedshiftsModelFunc, hide=["Flux1000", "Energy_Flux100", "PL_Index", "LP_Index", "LP_beta", "Frac_Variability"])
         else:
-            SVI_model = RedshiftsModelFunc    
+            SVI_Model = RedshiftsModelFunc    
         
-        overflow_1, overflow_2, train_dataloader_redshifts = InitialiseDataLoaders(train_data_tensor_redshifts.numpy(), train_redshifts_tensor.numpy())
+        overflow_1, overflow_2, train_dataloader_redshifts = InitialiseDataLoaders(train_data_tensor_redshifts, train_redshifts_tensor)
                 
         if cross_validation_k_redshifts > 1:
             #CV is useful to show that the model generalises well to unseen data; (hopefully) provides evidence that the precise split in the dataset is unimportant
             skf = sklearn.model_selection.KFold(cross_validation_k_redshifts) #Stratified K-fold CV keeps class compositions equal between fold splits
             
-            master_lpd = np.zeros(cross_validation_k_redshifts)
+            master_lpds = np.zeros(cross_validation_k_redshifts)
             master_RMSE = np.zeros(cross_validation_k_redshifts)
             master_r_squared = np.zeros(cross_validation_k_redshifts)
             master_chi_squared_reduced = np.zeros(cross_validation_k_redshifts)
@@ -1947,83 +2024,47 @@ if __name__=="__main__":
                 temp_train_data = train_data_tensor_redshifts[train_data]
                 temp_train_redshifts = train_redshifts_tensor[train_data]
                 
-                pyro.clear_param_store()
-                guide = pyro.infer.autoguide.AutoDiagonalNormal(SVI_model)
-                optimizer = pyro.optim.ClippedAdam({"lr": 1e-4, 'lrd': 0.01**(1/num_steps)})
-                svi = pyro.infer.SVI(SVI_model, guide, optimizer, loss=pyro.infer.Trace_ELBO())
+                overflow_1, overflow_2, temp_train_dataloader_redshifts = InitialiseDataLoaders(temp_train_data, temp_train_redshifts)
                 
-                for step in range(num_steps):
-                    loss = svi.step(temp_train_data, temp_train_redshifts)
-                    losses.append(loss)
-                    if step % (num_steps/5) == 0:
-                        print(f"Step {step}:, Loss: {loss}")
-                        
+                guide, losses = SVITrainingLoop(temp_train_dataloader_redshifts)
                 
-                predictive = pyro.infer.Predictive(RedshiftsModelFunc, guide=guide, num_samples=200)
+                predictive = pyro.infer.Predictive(SVI_Model, guide=guide, num_samples=200)
                 #samples=predictive(train_data_tensor_redshifts)
                 #print(samples["log_sigma"].mean(0))    
                 
-                preds, outputs, master_lpd[fold], master_RMSE[fold], master_r_squared[fold], master_chi_squared_reduced[fold] = RedshiftPlotting(temp_val_data, temp_val_redshifts, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, return_metrics=True)
+                preds, outputs, master_lpds[fold], master_RMSE[fold], master_r_squared[fold], master_chi_squared_reduced[fold] = RedshiftPerformance(temp_val_data, temp_val_redshifts, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, return_metrics=True)
                 master_avg_pred_std[fold] = np.std(np.mean(preds, axis=0))
                 
-            
-            print("Average NLPD from each fold: ", -master_lpd, "\nAverage NLPD over all folds: ", -np.mean(master_lpd))
+            print("Average NLPD from each fold: ", -master_lpds, "\nAverage NLPD over all folds: ", -np.mean(master_lpds))
             print("Average RMSE from each fold: ", master_RMSE, "\nAverage RMSE over all folds: ", np.mean(master_RMSE))
             print("Average R^2 score from each fold: ", master_r_squared, "\nAverage R^2 score over all folds: ", np.mean(master_r_squared))
             print("Average chi-squared from each fold: ", master_chi_squared_reduced, "\nAverage chi-squared over all folds: ", np.mean(master_chi_squared_reduced))
             print("Average std. from each fold: ", master_avg_pred_std, "\nAverage std. over all folds: ", np.mean(master_avg_pred_std))
         
         print("\nTraining on whole dataset now!")
-        num_epochs = 5000
-
-        pyro.clear_param_store()
-        guide = pyro.infer.autoguide.AutoDiagonalNormal(SVI_model)
-        optimizer = pyro.optim.ClippedAdam({"lr": 1e-4, 'lrd': 0.01**(1/(num_epochs*train_data_tensor_redshifts.shape[0]/32))})
-        svi = pyro.infer.SVI(SVI_model, guide, optimizer, loss=pyro.infer.Trace_ELBO())
-        
-        for epoch in range(num_epochs):
-            for batch in enumerate(train_dataloader_redshifts):
-                loss = svi.step(batch[1][0], batch[1][1])
-                losses.append(loss)
-            
-            if epoch % (num_epochs/5) == 0:
-                print(f"Epoch {epoch}:, Loss: {loss}")
-        '''
-        for step in range(num_steps):
-            loss = svi.step(train_data_tensor_redshifts, train_redshifts_tensor)
-            losses.append(loss)
-            if step % (num_steps/5) == 0:
-                print(f"Step {step}:, Loss: {loss}")
-        '''
-        #Train dataset graphs
-        predictive = pyro.infer.Predictive(RedshiftsModelFunc, guide=guide, num_samples=200)
+        guide, losses = SVITrainingLoop(train_dataloader_redshifts)
+               
+        predictive = pyro.infer.Predictive(SVI_Model, guide=guide, num_samples=200)
         samples=predictive(train_data_tensor_redshifts)
-        print(samples.keys())
+        print("Mean log_sigma:", samples["log_sigma"].mean(0))
         
+        #Train dataset graphs
         print("\nTraining Dataset Fitting:")
-        #print(samples["log_sigma"].mean(0))    
-        RedshiftPlotting(train_data_tensor_redshifts, train_redshifts_tensor, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(train_data_tensor_redshifts, train_redshifts_tensor, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
         
-        #Test dataset graphs
-        samples=predictive(test_data_tensor_redshifts)
-        
+        #Test dataset graphs        
         print("\nTest Dataset Fitting:")
-        mean_preds = samples["output_redshift"].mean(0)
-        RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(test_data_tensor_redshifts, test_redshifts_tensor, guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
         
         #Low-redshift test dataset graphs
         print("\nLow-Redshift Test Dataset Fitting:")
         low_redshift_indices = torch.where((test_redshifts_tensor*redshifts_z_score_tuple[1])+redshifts_z_score_tuple[0] < 1.5)
-        samples=predictive(test_data_tensor_redshifts[low_redshift_indices])
-        RedshiftPlotting(test_data_tensor_redshifts[low_redshift_indices], test_redshifts_tensor[low_redshift_indices], guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(test_data_tensor_redshifts[low_redshift_indices], test_redshifts_tensor[low_redshift_indices], guide=guide, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
     
         
         az.plot_trace(samples['Layer2.weight'].unsqueeze(0))
         plt.show()
         
-        plt.scatter(np.linspace(1, len(losses), len(losses)), np.log(np.array(losses)), marker='x')
-        plt.title("Loss graph for SVI")
-        plt.show()
         
     if using_HMC:
         #####HMC TRAINING METHOD FOR REDSHIFTS#####
@@ -2032,6 +2073,8 @@ if __name__=="__main__":
         list_mcmcs_redshift = []
         cross_validation_k_redshift = 1
         
+        HMC_Model = RedshiftsModelFunc    
+
         if cross_validation_k_redshift > 1:
             master_lpds = np.zeros(cross_validation_k_redshift)
             master_RMSE = np.zeros(cross_validation_k_redshift)
@@ -2048,7 +2091,7 @@ if __name__=="__main__":
                 temp_train_data = train_data_tensor_redshifts[train_data]
                 temp_train_redshifts = train_redshifts_tensor[train_data]
                     
-                mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, num_warmup_redshift, RedshiftsModelFunc, num_chains=1)
+                mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, num_warmup_redshift, HMC_Model, num_chains=1)
                 list_mcmcs_redshift.append(mcmc)
                 if sampled_uncertainties:
                     temp_samples = dict(list(mcmc.get_samples().items())[5:9])
@@ -2057,7 +2100,7 @@ if __name__=="__main__":
                 if 'log_sigma' not in temp_samples.keys():
                     temp_samples['log_sigma'] = (torch.zeros_like(temp_samples['Layer2.bias'])+global_redshift_obs_noise_scale).squeeze()
                 
-                preds, probs, lpd, RMSE, r_squared, chi_squared_reduced = RedshiftPlotting(temp_val_data, temp_val_redshifts, samples=temp_samples, redshifts_z_scored=redshifts_z_score_tuple, plots=True, return_metrics=True)
+                preds, probs, lpd, RMSE, r_squared, chi_squared_reduced = RedshiftPerformance(temp_val_data, temp_val_redshifts, samples=temp_samples, redshifts_z_scored=redshifts_z_score_tuple, plots=True, return_metrics=True)
                 
                 master_lpds[fold] = lpd
                 master_RMSE[fold] = RMSE
@@ -2071,7 +2114,7 @@ if __name__=="__main__":
             
             print("K-fold CV finished, training on all data now!")
             
-        mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, num_warmup_redshift, RedshiftsModelFunc, num_chains=4)
+        mcmc = MCMCMethod(train_data_tensor_redshifts, train_redshifts_tensor, num_samples_redshift, num_warmup_redshift, HMC_Model, num_chains=4)
         list_mcmcs_redshift.append(mcmc)
         
         if sampled_uncertainties:
@@ -2083,29 +2126,29 @@ if __name__=="__main__":
             
         #all_samples_redshift = ListMergingAndTrimmingMCMCs(list_mcmcs_redshift, is_redshifts=True)
         #all_samples_redshift['log_sigma'] = (torch.zeros_like(all_samples_redshift['Layer2.bias'])-global_redshift_obs_noise_scale).squeeze()
-        SaveSamples(all_samples_redshift, file_name='temp_samples_redshift_dict_full_mass_4_chains_no_input_unc.npy')
+        #SaveSamples(all_samples_redshift, file_name='temp_samples_redshift_dict_full_mass_4_chains_no_input_unc.npy')
     
-        all_samples_redshift = LoadSamples('temp_samples_redshift_dict_diag_mass_4_chains.npy')
+        #all_samples_redshift = LoadSamples('temp_samples_redshift_dict_diag_mass_4_chains.npy')
     
         az.plot_trace(mcmc.get_samples(group_by_chain=True)['Layer2.bias'])
         #all_samples_redshift = LoadSamples('temp_samples_redshift_dict.npy')
     
         #Training data predictions
         print("\nTraining Dataset Fitting:")
-        #RedshiftPlotting(train_data_tensor_redshifts, train_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(train_data_tensor_redshifts, train_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
         
         #Test data predictions
         print("\nTest Dataset Fitting:")
-        RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(test_data_tensor_redshifts, test_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
         
         #Low-redshift test data only!
         print("\nLow-Redshift Test Dataset Fitting:")
         low_redshift_indices = torch.where((test_redshifts_tensor*redshifts_z_score_tuple[1])+redshifts_z_score_tuple[0] < 1.5)
-        RedshiftPlotting(test_data_tensor_redshifts[low_redshift_indices], test_redshifts_tensor[low_redshift_indices], samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
+        RedshiftPerformance(test_data_tensor_redshifts[low_redshift_indices], test_redshifts_tensor[low_redshift_indices], samples=all_samples_redshift, redshifts_z_scored=redshifts_z_score_tuple, plots=True)
     
         #BCU Predictions
         #print("\nBCU Dataset Fitting:")
-        #RedshiftPlotting(known_bcu_data_tensor, known_bcu_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=(redshifts_mean, redshifts_std), plots=True)
+        #RedshiftPerformance(known_bcu_data_tensor, known_bcu_redshifts_tensor, samples=all_samples_redshift, redshifts_z_scored=(redshifts_mean, redshifts_std), plots=True)
         
         
         #Redshift MCMC diagnostics
@@ -2141,7 +2184,7 @@ if __name__=="__main__":
         temp_samples = {key: value.flatten(end_dim=1) for key, value in temp_samples.items()}
         print(temp_samples['Layer2.weight'].shape)
         temp_samples['log_sigma'] = (torch.zeros_like(temp_samples['Layer2.bias'].squeeze())-10)
-        RedshiftPlotting(test_data_tensor_redshifts, test_redshifts_tensor, samples=temp_samples, redshifts_log_transformed=redshifts_log_transformed, plots=True)
+        RedshiftPerformance(test_data_tensor_redshifts, test_redshifts_tensor, samples=temp_samples, redshifts_log_transformed=redshifts_log_transformed, plots=True)
     '''  
     
 def OuterUncSampling(input_features, input_classes, samples):
