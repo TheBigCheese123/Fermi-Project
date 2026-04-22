@@ -1,0 +1,7 @@
+text.usetex: True
+text.latex.preamble: \usepackage{amsmath}\usepackage{amssymb}
+font.family: serif
+font.serif: Times New Roman
+savefig.bbox: tight
+savefig.pad_inches: 0.02
+savefig.format: pdf
